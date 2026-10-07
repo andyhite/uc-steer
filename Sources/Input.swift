@@ -166,14 +166,18 @@ func hidServices() -> [IOHIDServiceClient] { (IOHIDEventSystemClientCopyServices
 func registryID(_ service: IOHIDServiceClient) -> UInt64 { (IOHIDServiceClientGetRegistryID(service) as? NSNumber)?.uint64Value ?? 0 }
 func property<T>(_ service: IOHIDServiceClient, _ key: String) -> T? { IOHIDServiceClientCopyProperty(service, key as CFString) as? T }
 
+// Vendor and product ID of the HID service with this registry ID, the sender CGEvent field 87 holds.
+func deviceID(sender: Int64) -> DeviceID? {
+    guard sender > 0, let service = hidServices().first(where: { registryID($0) == UInt64(sender) }),
+          let vendor: Int = property(service, kIOHIDVendorIDKey), let product: Int = property(service, kIOHIDProductIDKey)
+    else { return nil }
+    return DeviceID(vendor: vendor, product: product)
+}
+
+// The Universal Control device that sent an event, if one did.
 func remoteDevice(sender: Int64) -> DeviceID? {
     if let known = senderDevices[sender] { return known }
-    var id: DeviceID?
-    if sender > 0, isVirtual(UInt64(sender)),
-       let service = hidServices().first(where: { registryID($0) == UInt64(sender) }),
-       let vendor: Int = property(service, kIOHIDVendorIDKey), let product: Int = property(service, kIOHIDProductIDKey) {
-        id = DeviceID(vendor: vendor, product: product)
-    }
+    let id = sender > 0 && isVirtual(UInt64(sender)) ? deviceID(sender: sender) : nil
     senderDevices[sender] = .some(id)
     return id
 }
@@ -255,20 +259,22 @@ let actionTypes = Set([CGEventType.keyDown, .keyUp, .flagsChanged, .leftMouseDow
                        .rightMouseUp, .otherMouseDown, .otherMouseUp, .scrollWheel].map(\.rawValue) + [14])
 let pressTypes: Set<CGEventType> = [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]  // one log line each
 
-// Messages to other Macs: a tag byte, then a serialized CGEvent, or a symbolic hotkey ID (big-endian Int32).
+// Messages to other Macs: a tag byte, then either the sending mouse's vendor and product ID (2 bytes each) and a
+// serialized CGEvent, or a symbolic hotkey ID (Int32). Numbers are big-endian.
 let eventMessage: UInt8 = 0, hotKeyMessage: UInt8 = 1
 
 // System shortcuts SteerMouse can press: Mission Control, Application Windows, Desktop, Dashboard, Move Left and
 // Right a Space (each with its slow-motion variant), Launchpad, Notification Center.
 let symbolicHotKeys: [Int32] = [32, 34, 33, 35, 36, 37, 62, 63, 79, 80, 81, 82, 160, 163]
 
-// SteerMouse presses those shortcuts by binding them to a private key combination for the moment, so forwarding
-// the keystroke would do nothing on the other Mac. Returns the shortcut the keystroke triggers here, if any.
+// SteerMouse presses those shortcuts by binding shortcut N to key code N + 200 (no modifiers) for the moment, so
+// forwarding the keystroke would do nothing on the other Mac. Returns the shortcut the keystroke triggers here.
 func symbolicHotKey(for event: CGEvent) -> Int32? {
     let modifierMask: UInt64 = 0x1F0000  // caps lock, shift, control, option, command
     let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
     let modifiers = event.flags.rawValue & modifierMask
     return symbolicHotKeys.first { hotKey in
+        if keyCode == UInt16(hotKey + 200) && modifiers == 0 { return true }  // SteerMouse may restore the binding first
         var character: UInt16 = 0, code: UInt16 = 0, mods: UInt64 = 0
         return CGSGetSymbolicHotKeyValue(hotKey, &character, &code, &mods) == 0 && code == keyCode
             && mods & modifierMask == modifiers && CGSIsSymbolicHotKeyEnabled(hotKey)
@@ -297,8 +303,19 @@ func forward(_ type: CGEventType, _ event: CGEvent) -> Bool {
         return true
     }
     guard let data = event.data as Data? else { return false }
-    peers.send(Data([eventMessage]) + data)
-    if pressTypes.contains(type) { log("sent a SteerMouse action to the Mac with the pointer") }
+    // The mouse SteerMouse acted for, so the other Mac can apply its own settings for that mouse.
+    let id = deviceID(sender: event.getIntegerValueField(senderField))
+    var message = Data([eventMessage])
+    for value in [id?.vendor ?? 0, id?.product ?? 0] {
+        message += withUnsafeBytes(of: UInt16(truncatingIfNeeded: value).bigEndian) { Data($0) }
+    }
+    peers.send(message + data)
+    if type == .otherMouseDown {
+        let button = event.getIntegerValueField(.mouseEventButtonNumber) + 1
+        log("sent button \(button) of \(id?.key ?? "an unknown mouse") to the Mac with the pointer")
+    } else if pressTypes.contains(type) {
+        log("sent a SteerMouse action to the Mac with the pointer")
+    }
     return true
 }
 
@@ -314,8 +331,24 @@ func replay(_ message: Data) {
         } else {
             logOnce("\(hotKeyName(hotKey)) from another Mac has no shortcut in System Settings > Keyboard > Keyboard Shortcuts")
         }
-    } else if tag == eventMessage, let event = CGEvent(withDataAllocator: nil, data: Data(body) as CFData),
+    } else if tag == eventMessage, body.count > 4,
+              let event = CGEvent(withDataAllocator: nil, data: Data(body.dropFirst(4)) as CFData),
               actionTypes.contains(event.type.rawValue), let now = CGEvent(source: nil) {
+        let b = Array(body.prefix(4))
+        let id = DeviceID(vendor: Int(b[0]) << 8 | Int(b[1]), product: Int(b[2]) << 8 | Int(b[3]))
+        let button = event.getIntegerValueField(.mouseEventButtonNumber)
+        // SteerMouse turns buttons it reads itself, like the MX Master's gesture button, into ordinary button
+        // events for the mouse. Apply this Mac's settings for that mouse, as for clicks from Universal Control.
+        if event.type == .otherMouseDown {
+            reloadSettingsIfChanged()
+            if let action = settings(for: id)?.actions[1 << Int(button)], perform(action) {
+                handledButtons.insert(button)
+                return
+            }
+            logOnce("button \(button + 1) of \(id.key) from another Mac has no supported SteerMouse action here; passing it through")
+        } else if event.type == .otherMouseUp, handledButtons.remove(button) != nil {
+            return
+        }
         event.location = now.location  // the other Mac's pointer position means nothing here
         event.timestamp = now.timestamp
         event.setIntegerValueField(senderField, value: 0)  // a registry ID on the other Mac; must not match a device here
