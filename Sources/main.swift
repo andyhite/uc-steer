@@ -6,44 +6,17 @@ import notify
 
 // MARK: Pairing key
 
-// The secret your Macs share before they forward input to each other. Kept in the login keychain.
-enum PairingKey {
-    static let item: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-                                      kSecAttrService as String: "uc-steer", kSecAttrAccount as String: "pairing key"]
-
-    static func read() -> String? {
-        var query = item
-        query[kSecReturnData as String] = true
-        var data: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &data) == errSecSuccess, let data = data as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
-    }
-
-    static func save(_ key: String?) {
-        SecItemDelete(item as CFDictionary)
-        guard let key else { return }
-        var query = item
-        query[kSecValueData as String] = Data(key.utf8)
-        let status = SecItemAdd(query as CFDictionary, nil)
-        if status != errSecSuccess { log("can't save the pairing key: \(status)") }
-    }
-
-    // 4 groups of 5 characters from an alphabet without look-alikes: 100 random bits.
-    static func generate() -> String {
-        let alphabet = Array("ABCDEFGHJKLMNPQRSTUVWXYZ23456789")
-        return (0..<4).map { _ in String((0..<5).map { _ in alphabet.randomElement()! }) }.joined(separator: "-")
-    }
-}
-
 var pairingKey = PairingKey.read()
 
 func editPairingKey() {
     let alert = NSAlert()
     alert.messageText = "Pairing Key"
     alert.informativeText = """
-        uc-steer sends buttons Universal Control doesn't forward, like the MX Master's gesture button, to your \
-        other Macs that use this key. Copy it into uc-steer on each of them, or paste the key from another Mac. \
-        Clear it to turn forwarding off.
+        uc-steer sends buttons Universal Control doesn't forward, like the MX Master's gesture button, to a Mac \
+        you choose. Pairing with this key only authorizes Macs that share it; nothing is forwarded until you pick \
+        a destination under "Forward Gestures To" in the menu (default Off). Copy the key into uc-steer on each \
+        Mac, or paste it from another. Change the destination when switching Macs, and choose Off for an iPad. \
+        Clear the key to turn forwarding off.
         """
     let field = NSTextField(string: pairingKey ?? PairingKey.generate())
     field.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
@@ -54,9 +27,19 @@ func editPairingKey() {
     NSApp.activate(ignoringOtherApps: true)
     guard alert.runModal() == .alertFirstButtonReturn else { return }
     let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-    pairingKey = key.isEmpty ? nil : key
-    PairingKey.save(pairingKey)
-    peers.start(key: pairingKey)
+    let new = key.isEmpty ? nil : key
+    let status = PairingKey.save(new)
+    guard status == errSecSuccess else {
+        log("can't save the pairing key: \(status)")
+        let failure = NSAlert()
+        failure.messageText = "Couldn't save the pairing key"
+        failure.informativeText = "Keychain error \(status): \(SecCopyErrorMessageString(status, nil) as String? ?? "unknown"). The previous key is still in use."
+        failure.runModal()
+        return
+    }
+    guard new != pairingKey else { return }
+    pairingKey = new
+    peers.start(key: new)
 }
 
 func toggleStartAtLogin() {
@@ -117,10 +100,27 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         if pairingKey == nil {
             menu.addItem(menuItem("Gesture button forwarding is off"))
-        } else if peers.status.isEmpty {
-            menu.addItem(menuItem("No other Macs with uc-steer found"))
+        } else {
+            let peerStatus = peers.status
+            if peerStatus.isEmpty { menu.addItem(menuItem("No other Macs with uc-steer found")) }
+            for peer in peerStatus { menu.addItem(menuItem("\(peer.name): \(peer.state)")) }
+            let selected = forwardingDestination
+            let live = selected.flatMap { name in peerStatus.first { $0.name == name } }
+            let note = selected.map { live == nil ? "\($0) (unavailable)" : $0 } ?? "Off"
+            let root = NSMenuItem(title: "Forward Gestures To: \(note)", action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            sub.addItem(menuItem("Off", checked: selected == nil) { forwardingDestination = nil })
+            for peer in peerStatus {
+                sub.addItem(menuItem("\(peer.name): \(peer.state)", checked: selected == peer.name) {
+                    forwardingDestination = peer.name
+                })
+            }
+            if let selected, live == nil {
+                sub.addItem(menuItem("\(selected) (unavailable)", checked: true))
+            }
+            root.submenu = sub
+            menu.addItem(root)
         }
-        for peer in peers.status { menu.addItem(menuItem("\(peer.name): \(peer.state)")) }
         menu.addItem(menuItem("Pairing Key…", action: editPairingKey))
 
         menu.addItem(.separator())
@@ -167,7 +167,12 @@ app.mainMenu?.addItem(withTitle: "Edit", action: nil, keyEquivalent: "").submenu
 let statusMenu = StatusMenu()
 
 peers.onMessage = replay
+peers.onDisconnect = disconnectPeer
 peers.start(key: pairingKey)
+let terminationObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
+                                                                 object: app, queue: .main) { _ in
+    peers.start(key: nil) // Release replayed clicks before exiting; remote peers clean up on EOF.
+}
 
 let prompt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
 if AXIsProcessTrustedWithOptions(prompt) {

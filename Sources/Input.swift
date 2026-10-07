@@ -8,9 +8,9 @@
 //
 // Buttons Universal Control never sees: SteerMouse reads some buttons from the mouse itself (the MX Master's
 // gesture button, over Logitech's HID++ protocol), posts them as ordinary button events for that mouse, and maps
-// those in its event tap, on the Mac the mouse is connected to, wherever the pointer is. While the pointer is on
-// another Mac, uc-steer takes those button events before SteerMouse maps them and sends them to uc-steer on your
-// other Macs (Peers.swift). The Mac with the pointer applies its own SteerMouse settings to them.
+// those in its event tap, on the Mac the mouse is connected to, wherever the pointer is. While local pointer
+// input is redirected, uc-steer sends those buttons to the Mac explicitly selected in its menu. There is no
+// accessible authoritative API for automatically identifying the receiving Mac.
 
 import AppKit
 import CoreData
@@ -198,9 +198,9 @@ func remoteMice() -> [(name: String, id: DeviceID)] {
 
 // MARK: Where the pointer is
 
-// Universal Control publishes where this Mac's input goes; bit 1 is set while the pointer is on another device.
-// ponytail: undocumented, observed on macOS 27. If it goes away, the pointer always reads as here: forwarding
-// stops, and SteerMouse actions run on the Mac the mouse is connected to, as without uc-steer.
+// UniversalControl 199.0.4 publishes HID suppression flags: bit 0 = keyboard, bit 1 = pointer/scroll/digitizer.
+// A clear pointer bit does NOT identify the receiving Mac: idle Macs also publish zero.
+// ponytail: private notification, verified in macOS 27's binary; if unavailable, new presses stay local.
 let inputStateName = "user.uid.\(getuid()).com.apple.universalcontrol.inputstate"
 let inputStateToken: Int32 = {
     var token: Int32 = 0
@@ -242,9 +242,57 @@ func perform(_ action: [String: Any]) -> Bool {
 
 // MARK: Forwarding SteerMouse's buttons
 
-// Each message to another Mac: the mouse's vendor and product ID (big-endian UInt16 each), then a serialized
-// button event.
+// Messages: UCS/version prefix, vendor/product (UInt16 big-endian), sender ID (UInt64 big-endian), CGEvent data.
+// CGEvent serialization drops field 87, so the sender ID must travel separately. Connection IDs scope sessions.
 let peers = Peers()
+var forwardingDestination = UserDefaults.standard.string(forKey: "forwardingDestination") {
+    didSet { UserDefaults.standard.set(forwardingDestination, forKey: "forwardingDestination") }
+}
+// Explicit routing is a clean wire-format cutover: reject old peers' automatically broadcast events.
+let buttonMessagePrefix = Data([0x55, 0x43, 0x53, 0x01]) // UCS, version 1
+let buttonMessageHeaderSize = 16
+
+struct MouseButton: Hashable {
+    let sender: Int64
+    let button: Int64
+
+    init(_ event: CGEvent) {
+        sender = event.getIntegerValueField(senderField)
+        button = event.getIntegerValueField(.mouseEventButtonNumber)
+    }
+}
+
+struct ForwardedPress {
+    let pid: Int64
+    let device: DeviceID
+    let recipients: Set<UUID>
+}
+var forwardedButtons: [MouseButton: ForwardedPress] = [:]
+
+struct ReplayedButton: Hashable {
+    let peer: UUID
+    let mouse: MouseButton
+}
+enum ReplayedPress {
+    case handled
+    case posted(CGEvent)
+}
+var replayedButtons: [ReplayedButton: ReplayedPress] = [:]
+
+// CGEvent's other-button events cover buttons 3–32, never left/right clicks.
+func supportedButton(_ button: Int64) -> Bool { (2..<32).contains(button) }
+
+func buttonMessage(_ event: CGEvent, device: DeviceID) -> Data? {
+    guard let data = event.data as Data? else { return nil }
+    var message = buttonMessagePrefix
+    for value in [device.vendor, device.product] {
+        withUnsafeBytes(of: UInt16(truncatingIfNeeded: value).bigEndian) { message.append(contentsOf: $0) }
+    }
+    let sender = UInt64(bitPattern: event.getIntegerValueField(senderField))
+    withUnsafeBytes(of: sender.bigEndian) { message.append(contentsOf: $0) }
+    message.append(data)
+    return message
+}
 
 var steerMouseProcesses: [Int64: Bool] = [:]
 func isSteerMouse(_ pid: Int64) -> Bool {
@@ -254,53 +302,90 @@ func isSteerMouse(_ pid: Int64) -> Bool {
     return result
 }
 
-// Sends a button event SteerMouse posted to the other Macs, while the pointer is on one of them. True: drop it.
+// The press owns its route until release, even if the pointer moves or the connections disappear.
 func forward(_ type: CGEventType, _ event: CGEvent) -> Bool {
+    guard type == .otherMouseDown || type == .otherMouseUp || type == .otherMouseDragged else { return false }
+    let mouse = MouseButton(event)
     let pid = event.getIntegerValueField(.eventSourceUnixProcessID)
-    guard type == .otherMouseDown || type == .otherMouseUp, pid > 0, peers.isConnected, !pointerIsHere(),
-          isSteerMouse(pid), let data = event.data as Data? else { return false }
-    let id = deviceID(sender: event.getIntegerValueField(senderField))  // the mouse SteerMouse posted it for
-    var message = Data()
-    for value in [id?.vendor ?? 0, id?.product ?? 0] {
-        message += withUnsafeBytes(of: UInt16(truncatingIfNeeded: value).bigEndian) { Data($0) }
+    if let press = forwardedButtons[mouse], press.pid == pid {
+        if type == .otherMouseUp {
+            forwardedButtons[mouse] = nil
+            if let message = buttonMessage(event, device: press.device) {
+                peers.send(message, to: press.recipients)
+            }
+        }
+        return true
     }
-    peers.send(message + data)
-    if type == .otherMouseDown {
-        let button = event.getIntegerValueField(.mouseEventButtonNumber) + 1
-        log("sent button \(button) of \(id?.key ?? "an unknown mouse") to the Mac with the pointer")
-    }
+    // Never forward an orphan release or a press which began on this Mac.
+    guard type == .otherMouseDown, supportedButton(mouse.button), pid > 0,
+          let destination = forwardingDestination, let recipient = peers.connection(to: destination),
+          !pointerIsHere(), isSteerMouse(pid) else { return false }
+    let id = deviceID(sender: mouse.sender) ?? DeviceID(vendor: 0, product: 0)
+    guard let message = buttonMessage(event, device: id) else { return false }
+    let recipients = peers.send(message, to: [recipient])
+    guard !recipients.isEmpty else { return false }
+    forwardedButtons[mouse] = ForwardedPress(pid: pid, device: id, recipients: recipients)
+    log("sent button \(mouse.button + 1) of \(id.key) to the selected Mac: \(destination)")
     return true
 }
 
-// Applies a button another Mac forwarded, if the pointer is on this Mac: this Mac's SteerMouse settings for that
-// mouse, as for clicks from Universal Control, or a plain click when it has no supported action.
-func replay(_ message: Data) {
-    guard pointerIsHere(), message.count > 4,
-          let event = CGEvent(withDataAllocator: nil, data: Data(message.dropFirst(4)) as CFData),
-          event.type == .otherMouseDown || event.type == .otherMouseUp, let now = CGEvent(source: nil) else { return }
-    let b = Array(message.prefix(4))
-    let id = DeviceID(vendor: Int(b[0]) << 8 | Int(b[1]), product: Int(b[2]) << 8 | Int(b[3]))
-    let button = event.getIntegerValueField(.mouseEventButtonNumber)
-    if event.type == .otherMouseDown {
-        reloadSettingsIfChanged()
-        if let action = settings(for: id)?.actions[1 << Int(button)], perform(action) {
-            handledButtons.insert(button)
-            return
+func postReplayedButton(_ event: CGEvent) {
+    guard let now = CGEvent(source: nil) else { return }
+    event.location = now.location
+    event.timestamp = now.timestamp
+    event.setIntegerValueField(senderField, value: 0)
+    event.setIntegerValueField(.eventSourceUnixProcessID, value: Int64(getpid()))
+    event.post(tap: .cghidEventTap)
+}
+
+// Return a release only for a click we actually posted, not for a handled action or an orphan release.
+func takeReplayedRelease(_ button: ReplayedButton) -> CGEvent? {
+    guard let press = replayedButtons.removeValue(forKey: button), case .posted(let event) = press else { return nil }
+    event.type = .otherMouseUp
+    return event
+}
+
+func disconnectPeer(_ peer: UUID) {
+    for button in replayedButtons.keys.filter({ $0.peer == peer }) {
+        if let release = takeReplayedRelease(button) { postReplayedButton(release) }
+    }
+}
+
+// The sender explicitly selected this Mac. Its connection owns the press, independently of pointer movement.
+func replay(_ message: Data, from peer: UUID) {
+    guard message.count > buttonMessageHeaderSize, message.starts(with: buttonMessagePrefix),
+          let event = CGEvent(withDataAllocator: nil, data: Data(message.dropFirst(buttonMessageHeaderSize)) as CFData),
+          event.type == .otherMouseDown || event.type == .otherMouseUp else { return }
+    let b = message.startIndex + 4
+    let sender = message[(b + 4)..<(b + 12)].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+    event.setIntegerValueField(senderField, value: Int64(bitPattern: sender))
+    let mouse = MouseButton(event)
+    guard supportedButton(mouse.button) else { return }
+    let button = ReplayedButton(peer: peer, mouse: mouse)
+    if event.type == .otherMouseUp {
+        if let release = takeReplayedRelease(button) {
+            release.flags = event.flags
+            postReplayedButton(release)
         }
-        logOnce("button \(button + 1) of \(id.key) from another Mac has no supported SteerMouse action here; passing it through")
-    } else if handledButtons.remove(button) != nil {
         return
     }
-    event.location = now.location  // the other Mac's pointer position means nothing here
-    event.timestamp = now.timestamp
-    event.setIntegerValueField(senderField, value: 0)  // a registry ID on the other Mac; must not match a device here
-    event.post(tap: .cghidEventTap)
+    guard replayedButtons[button] == nil else { return }
+    let id = DeviceID(vendor: Int(message[b]) << 8 | Int(message[b + 1]),
+                      product: Int(message[b + 2]) << 8 | Int(message[b + 3]))
+    reloadSettingsIfChanged()
+    if let action = settings(for: id)?.actions[1 << Int(mouse.button)], perform(action) {
+        replayedButtons[button] = .handled
+    } else {
+        logOnce("button \(mouse.button + 1) of \(id.key) from another Mac has no supported SteerMouse action here; passing it through")
+        replayedButtons[button] = .posted(event)
+        postReplayedButton(event)
+    }
 }
 
 // MARK: Event tap
 
 var tap: CFMachPort?
-var handledButtons = Set<Int64>()  // presses uc-steer performed; their drags and release are dropped too
+var handledButtons = Set<MouseButton>()  // Only the originating HID service owns its handled press.
 
 // SteerMouse settings for the Universal Control device that sent the event, if any.
 func remoteSettings(_ event: CGEvent) -> Device? {
@@ -320,7 +405,7 @@ func flip(_ event: CGEvent, _ line: CGEventField, _ fixed: CGEventField, _ point
 // Returns true to drop the event.
 func handle(_ type: CGEventType, _ event: CGEvent) -> Bool {
     if forward(type, event) { return true }
-    let button = event.getIntegerValueField(.mouseEventButtonNumber)
+    let mouse = MouseButton(event)
     switch type {
     case .scrollWheel:
         guard let device = remoteSettings(event) else { return false }
@@ -332,13 +417,15 @@ func handle(_ type: CGEventType, _ event: CGEvent) -> Bool {
         }
         return false
     case .otherMouseDown:
-        guard let action = remoteSettings(event)?.actions[1 << Int(button)], perform(action) else { return false }
-        handledButtons.insert(button)
+        handledButtons.remove(mouse)  // A new press supersedes an interrupted press from this device.
+        guard supportedButton(mouse.button),
+              let action = remoteSettings(event)?.actions[1 << Int(mouse.button)], perform(action) else { return false }
+        handledButtons.insert(mouse)
         return true
     case .otherMouseUp:
-        return handledButtons.remove(button) != nil
+        return handledButtons.remove(mouse) != nil
     case .otherMouseDragged:
-        return handledButtons.contains(button)
+        return handledButtons.contains(mouse)
     default:
         return false
     }
@@ -364,12 +451,14 @@ func startTap() {
 // MARK: Check
 
 func check() {
+    print("Gesture forwarding destination: \(forwardingDestination ?? "Off") (selected manually)")
     reloadSettingsIfChanged()
     for device in devices {
         print("\(device.name) (\(device.id.key))")
         for (bit, action) in device.actions.sorted(by: { $0.key < $1.key }) {
             let (name, hotKey) = describe(action)
-            print("  button \(bit.trailingZeroBitCount + 1): \(name)" + (hotKey == nil ? " (not supported; click passes through)" : ""))
+            let supported = supportedButton(Int64(bit.trailingZeroBitCount)) && hotKey != nil
+            print("  button \(bit.trailingZeroBitCount + 1): \(name)" + (supported ? "" : " (not supported; click passes through)"))
         }
         let axes = [device.flipVertical ? "vertical" : nil, device.flipHorizontal ? "horizontal" : nil].compactMap { $0 }
         if !axes.isEmpty { print("  scroll: \(axes.joined(separator: " and ")) reversed") }
