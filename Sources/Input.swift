@@ -1,15 +1,22 @@
-// uc-steer: applies SteerMouse settings (button actions, scroll direction) to mouse input that arrives
-// through Universal Control.
+// uc-steer makes SteerMouse settings work for a mouse used through Universal Control.
 //
-// SteerMouse only applies settings to mice connected to this Mac. Its event tap matches each event's
-// sender (undocumented CGEvent field 87: the registry ID of the HID service that sent it) against the
-// devices it has opened. Universal Control delivers the other Mac's mouse as a virtual HID service that
-// has no IORegistry entry, so SteerMouse lets that input through untouched. uc-steer catches it, finds the
-// SteerMouse settings for the device with the same vendor and product ID, and applies them itself.
+// Clicks and scrolling: SteerMouse only applies settings to mice connected to this Mac. Its event tap matches
+// each event's sender (undocumented CGEvent field 87: the registry ID of the HID service that sent it) against
+// the devices it has opened. Universal Control delivers the other Mac's mouse as a virtual HID service that has
+// no IORegistry entry, so SteerMouse lets that input through untouched. uc-steer catches it, finds the
+// SteerMouse settings for that device, and applies them itself.
+//
+// Buttons Universal Control never sees: SteerMouse reads some buttons from the mouse directly (the MX Master's
+// gesture button, over Logitech's HID++ protocol) and performs their action on the Mac the mouse is connected
+// to, wherever the pointer is. While the pointer is on another Mac, uc-steer drops the input events SteerMouse
+// posts for those actions and sends them to uc-steer on your other Macs (Peers.swift). The Mac with the pointer
+// posts them.
 
 import AppKit
 import CoreData
 import IOKit.hid
+import notify
+import os
 
 // Private SkyLight functions. SteerMouse uses the same ones to trigger Mission Control shortcuts.
 @_silgen_name("CGSGetSymbolicHotKeyValue")
@@ -22,6 +29,7 @@ func CGSSetSymbolicHotKeyEnabled(_ hotKey: Int32, _ enabled: Bool) -> Int32
 
 let senderField = CGEventField(rawValue: 87)!
 let store = URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support/SteerMouse & CursorSense/Device.smsetting")
+let steerMouseManager = "jp.plentycom.boa.SteerMouse"  // bundle ID of the SteerMouse process that performs actions
 
 // SteerMouse "Mission Control" actions, and the system shortcut (symbolic hotkey ID) each one presses.
 let missionOps: [String: Int32] = [
@@ -29,21 +37,30 @@ let missionOps: [String: Int32] = [
     "Move Left a Space": 79, "Move Right a Space": 81,
 ]
 
-struct DeviceID: Hashable { let vendor: Int, product: Int }
+struct DeviceID: Hashable {
+    let vendor: Int, product: Int
+    var key: String { String(format: "%04x:%04x", vendor, product) }
+}
 struct Device {
     let name: String
+    let id: DeviceID
     let actions: [Int: [String: Any]]  // button bit (1 << CGEvent button number) -> SteerMouse action
     let flipVertical: Bool, flipHorizontal: Bool  // SteerMouse reverses this scroll axis
 }
 struct Failure: Error, CustomStringConvertible { let description: String }
 
-func log(_ message: String) { print("\(Date().formatted(.iso8601)) \(message)") }
+let logger = Logger(subsystem: "com.andyhite.uc-steer", category: "uc-steer")
+// To the unified log (`log stream --predicate 'subsystem == "com.andyhite.uc-steer"'`), and stdout for --check.
+func log(_ message: String) {
+    logger.notice("\(message, privacy: .public)")
+    print(message)
+}
 var loggedOnce = Set<String>()
 func logOnce(_ message: String) { if loggedOnce.insert(message).inserted { log(message) } }
 
 // MARK: SteerMouse settings
 
-func loadSettings() throws -> [DeviceID: Device] {
+func loadSettings() throws -> [Device] {
     guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "jp.plentycom.app.SteerMouse"),
           let model = NSManagedObjectModel(contentsOf: app.appendingPathComponent("Contents/Resources/Device.momd"))
     else { throw Failure(description: "SteerMouse is not installed") }
@@ -53,7 +70,7 @@ func loadSettings() throws -> [DeviceID: Device] {
     let context = NSManagedObjectContext(concurrencyType: .mainQueueConcurrencyType)
     context.persistentStoreCoordinator = coordinator
 
-    var devices: [DeviceID: Device] = [:]
+    var devices: [Device] = []
     for device in try context.fetch(NSFetchRequest<NSManagedObject>(entityName: "Device")) {
         guard let vendor = device.value(forKey: "vid") as? Int, let product = device.value(forKey: "pid") as? Int,
               device.value(forKey: "actionDisabled") as? Bool != true else { continue }
@@ -79,13 +96,12 @@ func loadSettings() throws -> [DeviceID: Device] {
         let horizontal = device.value(forKey: "hScrollOp") as? String == "Roll" ? "Roll" : "Tilt"
         let flipVertical = reversesAxis(wheelDirections, "Roll Up", "Up", "Roll Down", "Down", device: name)
         let flipHorizontal = reversesAxis(wheelDirections, "\(horizontal) Left", "Left", "\(horizontal) Right", "Right", device: name)
-        // ponytail: two configured mice with the same vendor/product ID (same receiver model): the first wins
-        let id = DeviceID(vendor: vendor, product: product)
-        if devices[id] == nil, !actions.isEmpty || flipVertical || flipHorizontal {
-            devices[id] = Device(name: name, actions: actions, flipVertical: flipVertical, flipHorizontal: flipHorizontal)
+        if !actions.isEmpty || flipVertical || flipHorizontal {
+            devices.append(Device(name: name, id: DeviceID(vendor: vendor, product: product), actions: actions,
+                                  flipVertical: flipVertical, flipHorizontal: flipHorizontal))
         }
     }
-    return devices
+    return devices.sorted { $0.name < $1.name }
 }
 
 // True when SteerMouse reverses both directions of one wheel axis. Other remaps (one direction only, or onto
@@ -100,7 +116,7 @@ func reversesAxis(_ directions: [String: String], _ wheelA: String, _ a: String,
     return false
 }
 
-var devices: [DeviceID: Device] = [:]
+var devices: [Device] = []
 var settingsDate: Date? = .distantPast
 
 func reloadSettingsIfChanged() {
@@ -109,11 +125,22 @@ func reloadSettingsIfChanged() {
     settingsDate = date
     do {
         devices = try loadSettings()
-        log("loaded SteerMouse settings for: " + devices.values.map(\.name).sorted().joined(separator: ", "))
+        log("loaded SteerMouse settings for: " + devices.map(\.name).joined(separator: ", "))
     } catch {
-        devices = [:]
+        devices = []
         log("can't read SteerMouse settings: \(error)")
     }
+}
+
+// The SteerMouse device whose settings each Universal Control mouse uses, keyed by DeviceID.key. Chosen in the
+// menu. Mice without an entry use the SteerMouse device with the same vendor and product ID.
+var settingsOverrides = UserDefaults.standard.dictionary(forKey: "settingsOverrides") as? [String: String] ?? [:] {
+    didSet { UserDefaults.standard.set(settingsOverrides, forKey: "settingsOverrides") }
+}
+
+func settings(for id: DeviceID) -> Device? {
+    if let name = settingsOverrides[id.key], let device = devices.first(where: { $0.name == name }) { return device }
+    return devices.first { $0.id == id }
 }
 
 // The action's name, and the symbolic hotkey for it if uc-steer supports the action.
@@ -151,6 +178,38 @@ func remoteDevice(sender: Int64) -> DeviceID? {
     return id
 }
 
+// Universal Control's copies of your other Macs' mice, one per vendor and product ID.
+func remoteMice() -> [(name: String, id: DeviceID)] {
+    var mice: [DeviceID: String] = [:]
+    for service in hidServices() where property(service, kIOHIDPrimaryUsagePageKey) == kHIDPage_GenericDesktop
+        && property(service, kIOHIDPrimaryUsageKey) == kHIDUsage_GD_Mouse
+        && property(service, kIOHIDTransportKey) != "UniversalControl"  // Universal Control's own pointer
+        && isVirtual(registryID(service)) {
+        let id = DeviceID(vendor: property(service, kIOHIDVendorIDKey) ?? 0, product: property(service, kIOHIDProductIDKey) ?? 0)
+        let product: String = property(service, kIOHIDProductKey) ?? "?"
+        mice[id] = product.hasPrefix("V-") ? String(product.dropFirst(2)) : product  // Universal Control adds "V-"
+    }
+    return mice.map { (name: $0.value, id: $0.key) }.sorted { $0.name < $1.name }
+}
+
+// MARK: Where the pointer is
+
+// Universal Control publishes where this Mac's input goes; bit 1 is set while the pointer is on another device.
+// ponytail: undocumented, observed on macOS 27. If it goes away, the pointer always reads as here: forwarding
+// stops, and SteerMouse actions run on the Mac the mouse is connected to, as without uc-steer.
+let inputStateName = "user.uid.\(getuid()).com.apple.universalcontrol.inputstate"
+let inputStateToken: Int32 = {
+    var token: Int32 = 0
+    notify_register_check(inputStateName, &token)
+    return token
+}()
+
+func pointerIsHere() -> Bool {
+    var state: UInt64 = 0
+    notify_get_state(inputStateToken, &state)
+    return state & 2 == 0
+}
+
 // MARK: Actions
 
 func perform(_ action: [String: Any]) -> Bool {
@@ -177,16 +236,56 @@ func perform(_ action: [String: Any]) -> Bool {
     return true
 }
 
+// MARK: Forwarding SteerMouse actions
+
+let peers = Peers()
+var forwardsActions = false  // a pairing key is set; the tap then also watches keyboard and click events
+
+// Event types SteerMouse posts for actions: keystrokes, clicks, scrolling, and 14, system-defined (media keys).
+let actionTypes = Set([CGEventType.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp, .rightMouseDown,
+                       .rightMouseUp, .otherMouseDown, .otherMouseUp, .scrollWheel].map(\.rawValue) + [14])
+let pressTypes: Set<CGEventType> = [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]  // one log line each
+
+var steerMouseProcesses: [Int64: Bool] = [:]
+func isSteerMouse(_ pid: Int64) -> Bool {
+    if let known = steerMouseProcesses[pid] { return known }
+    let result = NSRunningApplication(processIdentifier: pid_t(pid))?.bundleIdentifier == steerMouseManager
+    steerMouseProcesses[pid] = result
+    return result
+}
+
+// Sends an event SteerMouse posted to the other Macs, while the pointer is on one of them. True: drop it here.
+func forward(_ type: CGEventType, _ event: CGEvent) -> Bool {
+    let pid = event.getIntegerValueField(.eventSourceUnixProcessID)
+    guard pid > 0, actionTypes.contains(type.rawValue), peers.isConnected, !pointerIsHere(), isSteerMouse(pid),
+          let data = event.data as Data? else { return false }
+    peers.send(data)
+    if pressTypes.contains(type) { log("sent a SteerMouse action to the Mac with the pointer") }
+    return true
+}
+
+// Posts an event another Mac forwarded, if the pointer is on this Mac.
+func replay(_ data: Data) {
+    guard pointerIsHere(), let event = CGEvent(withDataAllocator: nil, data: data as CFData),
+          actionTypes.contains(event.type.rawValue), let now = CGEvent(source: nil) else { return }
+    event.location = now.location  // the other Mac's pointer position means nothing here
+    event.timestamp = now.timestamp
+    event.setIntegerValueField(senderField, value: 0)  // a registry ID on the other Mac; must not match a device here
+    event.post(tap: .cghidEventTap)
+    if pressTypes.contains(event.type) { log("performed a SteerMouse action from another Mac") }
+}
+
 // MARK: Event tap
 
 var tap: CFMachPort?
+var tapSource: CFRunLoopSource?
 var handledButtons = Set<Int64>()  // presses uc-steer performed; their drags and release are dropped too
 
 // SteerMouse settings for the Universal Control device that sent the event, if any.
 func remoteSettings(_ event: CGEvent) -> Device? {
     guard let id = remoteDevice(sender: event.getIntegerValueField(senderField)) else { return nil }
     reloadSettingsIfChanged()
-    return devices[id]
+    return settings(for: id)
 }
 
 // Negates one scroll axis. The line delta goes first, in case CoreGraphics derives the other two from it.
@@ -199,6 +298,7 @@ func flip(_ event: CGEvent, _ line: CGEventField, _ fixed: CGEventField, _ point
 
 // Returns true to drop the event.
 func handle(_ type: CGEventType, _ event: CGEvent) -> Bool {
+    if forwardsActions, forward(type, event) { return true }
     let button = event.getIntegerValueField(.mouseEventButtonNumber)
     switch type {
     case .scrollWheel:
@@ -216,14 +316,20 @@ func handle(_ type: CGEventType, _ event: CGEvent) -> Bool {
         return true
     case .otherMouseUp:
         return handledButtons.remove(button) != nil
-    default:
+    case .otherMouseDragged:
         return handledButtons.contains(button)
+    default:
+        return false
     }
 }
 
+// (Re)creates the event tap. Call it again after forwardsActions changes.
 func startTap() {
-    let types: [CGEventType] = [.otherMouseDown, .otherMouseUp, .otherMouseDragged, .scrollWheel]
-    let mask = types.reduce(CGEventMask(0)) { $0 | CGEventMask(1) << $1.rawValue }
+    if let tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), tapSource, .commonModes) }
+    if let tap { CFMachPortInvalidate(tap) }
+    var types = Set([CGEventType.otherMouseDown, .otherMouseUp, .otherMouseDragged, .scrollWheel].map(\.rawValue))
+    if forwardsActions { types.formUnion(actionTypes) }
+    let mask = types.reduce(CGEventMask(0)) { $0 | CGEventMask(1) << $1 }
     tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
                             eventsOfInterest: mask, callback: { _, type, event, _ in
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -232,18 +338,19 @@ func startTap() {
         }
         return handle(type, event) ? nil : Unmanaged.passUnretained(event)
     }, userInfo: nil)
-    guard let tap else { log("can't create the event tap"); exit(1) }
-    CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
+    guard let tap else { tapSource = nil; log("can't create the event tap"); return }
+    tapSource = CFMachPortCreateRunLoopSource(nil, tap, 0)
+    CFRunLoopAddSource(CFRunLoopGetMain(), tapSource, .commonModes)
     reloadSettingsIfChanged()
-    log("watching for Universal Control clicks and scrolling")
+    log("watching Universal Control input" + (forwardsActions ? " and SteerMouse actions" : ""))
 }
 
-// MARK: Main
+// MARK: Check
 
 func check() {
     reloadSettingsIfChanged()
-    for (id, device) in devices.sorted(by: { $0.value.name < $1.value.name }) {
-        print("\(device.name) (\(String(format: "%04x:%04x", id.vendor, id.product)))")
+    for device in devices {
+        print("\(device.name) (\(device.id.key))")
         for (bit, action) in device.actions.sorted(by: { $0.key < $1.key }) {
             let (name, hotKey) = describe(action)
             print("  button \(bit.trailingZeroBitCount + 1): \(name)" + (hotKey == nil ? " (not supported; click passes through)" : ""))
@@ -251,26 +358,9 @@ func check() {
         let axes = [device.flipVertical ? "vertical" : nil, device.flipHorizontal ? "horizontal" : nil].compactMap { $0 }
         if !axes.isEmpty { print("  scroll: \(axes.joined(separator: " and ")) reversed") }
     }
-    print("Universal Control pointing devices on this Mac now:")
-    for service in hidServices() where property(service, kIOHIDPrimaryUsagePageKey) == kHIDPage_GenericDesktop
-        && property(service, kIOHIDPrimaryUsageKey) == kHIDUsage_GD_Mouse && isVirtual(registryID(service)) {
-        let id = DeviceID(vendor: property(service, kIOHIDVendorIDKey) ?? 0, product: property(service, kIOHIDProductIDKey) ?? 0)
-        let product: String = property(service, kIOHIDProductKey) ?? "?"
-        let settings = devices[id].map { "uses SteerMouse settings for \($0.name)" } ?? "no SteerMouse settings"
-        print("  \(product) (\(String(format: "%04x:%04x", id.vendor, id.product))): \(settings)")
+    print("Universal Control mice on this Mac now:")
+    for mouse in remoteMice() {
+        let source = settings(for: mouse.id).map { "uses SteerMouse settings for \($0.name)" } ?? "no SteerMouse settings"
+        print("  \(mouse.name) (\(mouse.id.key)): \(source)")
     }
 }
-
-setvbuf(stdout, nil, _IOLBF, 0)
-if CommandLine.arguments.contains("--check") { check(); exit(0) }
-
-let prompt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
-if AXIsProcessTrustedWithOptions(prompt) {
-    startTap()
-} else {
-    log("waiting for Accessibility permission: System Settings > Privacy & Security > Accessibility > uc-steer")
-    Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { timer in
-        if AXIsProcessTrusted() { timer.invalidate(); startTap() }
-    }
-}
-RunLoop.main.run()
