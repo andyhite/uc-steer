@@ -1,114 +1,95 @@
+<div align="center">
+
 # uc-steer
 
-Makes your [SteerMouse](https://plentycom.jp/en/steermouse/) settings work for a mouse you use through
-Universal Control.
+### Your mouse does more. Even on the other Mac.
 
-SteerMouse only applies settings to mice connected to the Mac it runs on. When Universal Control moves the
-pointer to another Mac, SteerMouse there can't see the mouse, so button mappings and scroll direction stop
-working. Buttons that SteerMouse reads from the mouse itself, like the MX Master's gesture button, are worse:
-their action still runs on the Mac the mouse is connected to.
+Bring your favorite SteerMouse shortcuts and scroll direction to Universal Control.
 
-uc-steer is a menu bar app you run on each Mac. It:
+**Native macOS menu bar app · Encrypted local connections · [MIT licensed](LICENSE)**
 
-- applies that Mac's SteerMouse settings to the clicks and scrolling Universal Control forwards to it;
-- sends buttons Universal Control doesn't forward to a Mac you explicitly select, over your local network.
-  That Mac applies its SteerMouse settings to them too.
+[Get started](#get-started) · [Gesture forwarding](#bring-your-gesture-button-along) · [Compatibility](#know-before-you-install)
 
-It works in either direction: choose a forwarding destination on whichever Mac has the mouse connected.
+</div>
 
-## Install
+---
 
-Needs SteerMouse and Xcode or the Command Line Tools (`swiftc`). The build targets macOS 13 or later,
-but the private Universal Control integration has only been investigated on macOS 27; the deployment
-target is not a compatibility guarantee for older releases. On each Mac:
+Universal Control moves your pointer between Macs. Your [SteerMouse](https://plentycom.jp/en/steermouse/) customizations don't follow: the receiving Mac can't see the physical mouse, and special buttons can still trigger actions on the Mac you left behind.
 
-1. Optional: create a code signing certificate in Keychain Access
-   (`/System/Library/CoreServices/Applications/Keychain Access.app`): Certificate Assistant > Create a
-   Certificate…, Name `uc-steer dev`, Identity Type Self-Signed Root, Certificate Type Code Signing. Without it,
-   builds are signed ad hoc and macOS asks for permissions again after every reinstall. To use a certificate
-   with another name, run `CODESIGN_IDENTITY="name" ./install.sh`.
-2. `git clone https://github.com/andyhite/uc-steer.git && uc-steer/install.sh`. The script builds
-   `uc-steer.app`, copies it to `/Applications` and opens it. If a keychain dialog asks to let codesign use the
-   key, click Always Allow. To update later, run `git pull && ./install.sh` in the `uc-steer` folder.
-3. Allow uc-steer in System Settings > Privacy & Security > Accessibility.
-4. In the menu bar icon (a mouse), turn on Start at Login.
+**uc-steer bridges that gap.** Run it on each Mac to apply that Mac's supported SteerMouse settings to incoming mouse events—and send otherwise stranded gesture-button presses to the Mac you choose.
 
-Configure the mouse in SteerMouse on every Mac you use it on. Each Mac applies its own SteerMouse settings.
+- **Keep your shortcuts close.** Open Mission Control, show the desktop, or move between Spaces with your middle and auxiliary buttons.
+- **Scroll your way.** Carry over SteerMouse's scroll-direction reversal for wheels with both directions reversed.
+- **Bring the gesture button along.** Forward buttons Universal Control doesn't carry, including the MX Master's gesture button.
+- **Stay out of the way.** A menu bar app with Start at Login, peer connection status, and no separate mapping editor to maintain.
 
-Updates build, sign, and stage the replacement before stopping the installed app. The previous bundle is
-kept until the replacement launches; failed replacement or launch attempts restore it. If restoration
-itself fails, the installer prints the retained backup's path instead of deleting it.
+## Get started
 
-## Forward the gesture button
+You'll need **SteerMouse configured on each Mac**, working Universal Control between them, and Xcode or the Command Line Tools (`swiftc`) to build the app. Read the [compatibility note](#know-before-you-install) before installing.
 
-1. On one Mac, choose Pairing Key… in the menu, then Save. Copy the key.
-2. On each other Mac, choose Pairing Key…, paste the key, then Save.
-3. Allow uc-steer when macOS asks to find devices on your local network.
-4. On the Mac with the mouse connected, choose the receiving Mac in **Forward Gestures To**.
-   The default is **Off**. Change the selection when switching Macs, and turn it **Off** for an iPad.
+Run on **each Mac**:
 
-Destination selection is manual, not automatic pointer tracking. A selected Mac receives gesture actions
-even if you move the pointer to a different remote device. No other peer receives those presses. If the
-selected peer is unavailable, new presses stay local; uc-steer never substitutes another peer.
-An already-forwarded press keeps its original route through release, even after changing the selection.
-Disconnecting releases any pass-through clicks held by that connection.
+```sh
+git clone https://github.com/andyhite/uc-steer.git
+cd uc-steer
+./install.sh
+```
 
-Update **every Mac** together: the explicitly routed event format intentionally rejects older versions'
-automatic broadcasts. Existing pairing keys are retained, but forwarding stays Off until you select a destination.
+The installer builds the app, places it in `/Applications`, and opens it.
 
-The menu lists the other Macs and whether they're connected. The menu bar icon dims while the pointer is on
-another Mac.
+1. Allow **uc-steer** in **System Settings → Privacy & Security → Accessibility**.
+2. Click the mouse icon in the menu bar and enable **Start at Login**.
+3. Configure your preferred actions in SteerMouse on each Mac. Each Mac uses its own settings—not a synced copy.
 
-Pairing-key changes take effect only after Keychain saves them successfully. A failed save or clear shows
-an error and leaves the active key unchanged. Saving the same key does not reconnect peers.
+Mouse profiles match automatically by vendor and product ID. If you use Bluetooth on one Mac and a receiver on another, choose the matching SteerMouse profile from the mouse's submenu.
 
-Anyone with the key can make your Macs perform mouse button actions, so keep it private. Connections are
-encrypted (TLS with a key derived from the pairing key).
+<details>
+<summary><strong>Optional: keep permissions across reinstalls</strong></summary>
 
-## Choose settings for a mouse
+Before installing, open **Keychain Access → Certificate Assistant → Create a Certificate…** and create a certificate named `uc-steer dev`, with **Identity Type: Self-Signed Root** and **Certificate Type: Code Signing**. If codesign asks to access the key, choose **Always Allow**.
 
-The menu lists the mice Universal Control brings in from your other Macs. Each one uses the SteerMouse settings
-for the device with the same vendor and product ID. To use another device's settings, for example when the
-mouse connects to this Mac differently (Bluetooth instead of a receiver), choose it in that mouse's submenu.
+For an existing certificate with another name, use `CODESIGN_IDENTITY="name" ./install.sh`. Without a certificate, the app is signed ad hoc and macOS asks for permissions again after each reinstall.
 
-## What it applies
+</details>
 
-- Buttons 3–32 (middle and auxiliary buttons): actions from SteerMouse's Mission Control group—Mission
-  Control, Application Windows, Desktop, Move Left a Space, Move Right a Space. Left/right-button mappings
-  are not applied. Other actions pass through as plain clicks. Each supported action uses the receiving
-  Mac's keyboard shortcut (System Settings > Keyboard > Keyboard Shortcuts > Mission Control).
-- Scroll direction, when SteerMouse reverses both directions of a wheel.
+## Bring your gesture button along
 
-The same applies to forwarded buttons like the gesture button. Not applied: scroll speed, cursor speed,
-per-app settings, modifier+button combinations.
+1. On one Mac, open **Pairing Key…** from the menu, save the key, and copy it.
+2. On the other Macs, paste that key into **Pairing Key…** and save.
+3. Allow local-network access when macOS asks.
+4. On the Mac with the mouse connected, choose a destination under **Forward Gestures To**.
 
-## How it works
+**You choose the destination; it doesn't track the pointer.** Forwarding defaults to **Off**. Change the destination when switching Macs, and turn it **Off** for an iPad. If the selected Mac is unavailable, new presses stay local—another Mac is never substituted.
 
-- SteerMouse's event tap matches each event's sender (undocumented CGEvent field 87, the registry ID of the HID
-  service) against the mice it opened. Universal Control's copy of a remote mouse is a virtual HID service with
-  no IORegistry entry, so SteerMouse ignores it. uc-steer catches those events and applies the settings itself.
-- SteerMouse reads some buttons from the mouse itself (the MX Master's gesture button, over Logitech's HID++
-  protocol), posts them as ordinary button events for that mouse, and maps those in its event tap. That happens
-  on the Mac the mouse is connected to. The undocumented notification
-  `user.uid.<uid>.com.apple.universalcontrol.inputstate` reports local HID input suppression, not the receiving
-  Mac's identity. While pointer input is redirected, uc-steer forwards these buttons only to the selected Mac.
-  A clear suppression bit also occurs on uninvolved Macs, so it is not used to accept incoming events.
-  If the notification is unavailable, new presses stay local. The authoritative diagnostic interface requires
-  Apple-private entitlements; uc-steer does not attempt to bypass them.
+Connections are encrypted over your local network. Keep the pairing key private: anyone with it can send mouse-button actions to your Macs.
 
-## Check
+## Know before you install
 
-`/Applications/uc-steer.app/Contents/MacOS/uc-steer --check` lists the manually selected forwarding destination,
-the SteerMouse settings uc-steer will apply, and the Universal Control mice on this Mac right now.
+**Focused support, not a full SteerMouse replacement.** uc-steer applies Mission Control, Application Windows, Desktop, Move Left a Space, and Move Right a Space to buttons **3–32**, using the receiving Mac's configured Mission Control keyboard shortcuts. Other actions pass through as plain clicks. Scroll reversal is supported when SteerMouse reverses both directions of a wheel.
 
-Log: `log stream --predicate 'subsystem == "com.andyhite.uc-steer"'`
+It does **not** apply left/right-button mappings, scroll or cursor speed, per-app settings, or modifier+button combinations.
 
-Run `sh test.sh` for the focused regression checks. They build in a temporary directory and cover input
-ownership without posting events, loopback-only TLS framing/reconnection, a disposable Keychain service
-(with prompts disabled), and installer failure/rollback using temporary paths and stubbed system tools.
-They do not install the app, change its real pairing key, or verify multi-Mac hardware behavior.
+> **Compatibility:** The build targets macOS 13+, but the private Universal Control integration has only been investigated on macOS 27. The deployment target is not a guarantee of compatibility with older macOS releases.
 
-## Uninstall
+<details>
+<summary><strong>Updates, diagnostics & removal</strong></summary>
 
-Turn off Start at Login in the menu, then run `./install.sh uninstall` and remove uc-steer from System Settings
-> Privacy & Security > Accessibility.
+**Update:** Run `git pull && ./install.sh` from the repository folder on every Mac. Keep all Macs on the same version; older broadcast-based versions cannot forward to current versions. Pairing keys are retained, but when upgrading from an older broadcast-based version, select a forwarding destination to enable forwarding.
+
+**Inspect settings and detected mice:**
+
+```sh
+/Applications/uc-steer.app/Contents/MacOS/uc-steer --check
+```
+
+**Stream logs:**
+
+```sh
+log stream --predicate 'subsystem == "com.andyhite.uc-steer"'
+```
+
+**Run regression checks:** `sh test.sh`. These do not verify multi-Mac hardware behavior.
+
+**Uninstall:** Turn off **Start at Login**, run `./install.sh uninstall`, and remove uc-steer from **System Settings → Privacy & Security → Accessibility**.
+
+</details>
