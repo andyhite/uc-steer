@@ -11,7 +11,8 @@ their action still runs on the Mac the mouse is connected to.
 uc-steer is a menu bar app you run on each Mac. It:
 
 - applies that Mac's SteerMouse settings to the clicks and scrolling Universal Control forwards to it;
-- sends SteerMouse's actions for the other buttons to the Mac the pointer is on, over your local network.
+- sends the buttons Universal Control doesn't forward to the Mac the pointer is on, over your local network.
+  That Mac applies its SteerMouse settings to them too.
 
 It works in either direction: whichever Mac the mouse is connected to sends, the Mac with the pointer acts.
 
@@ -41,7 +42,7 @@ Configure the mouse in SteerMouse on every Mac you use it on. Each Mac applies i
 The menu lists the other Macs and whether they're connected. The menu bar icon dims while the pointer is on
 another Mac.
 
-Anyone with the key can make your Macs perform mouse and keyboard input, so keep it private. Connections are
+Anyone with the key can make your Macs perform mouse button actions, so keep it private. Connections are
 encrypted (TLS with a key derived from the pairing key).
 
 ## Choose settings for a mouse
@@ -53,26 +54,24 @@ mouse connects to this Mac differently (Bluetooth instead of a receiver), choose
 ## What it applies
 
 - Button actions from SteerMouse's Mission Control group: Mission Control, Application Windows, Desktop,
-  Move Left a Space, Move Right a Space. Other actions pass through as plain clicks.
+  Move Left a Space, Move Right a Space. Other actions pass through as plain clicks. Each action uses the
+  receiving Mac's keyboard shortcut for it (System Settings > Keyboard > Keyboard Shortcuts > Mission Control).
 - Scroll direction, when SteerMouse reverses both directions of a wheel.
-- Forwarded actions. Mission Control actions run as the same action on the receiving Mac, which needs a keyboard
-  shortcut for it in System Settings > Keyboard > Keyboard Shortcuts (Mission Control, Application Windows,
-  Desktop and Move Left/Right a Space have one by default). Keystroke, click and scroll actions are replayed
-  as they are.
 
-Not applied: scroll speed, cursor speed, per-app settings, modifier+button combinations, and forwarded actions
-that SteerMouse performs another way, like opening an app or a URL. Those still run on the Mac the mouse is
-connected to.
+The same applies to forwarded buttons like the gesture button. Not applied: scroll speed, cursor speed,
+per-app settings, modifier+button combinations.
 
 ## How it works
 
 - SteerMouse's event tap matches each event's sender (undocumented CGEvent field 87, the registry ID of the HID
   service) against the mice it opened. Universal Control's copy of a remote mouse is a virtual HID service with
   no IORegistry entry, so SteerMouse ignores it. uc-steer catches those events and applies the settings itself.
-- Universal Control publishes where the pointer is in an undocumented notification,
-  `user.uid.<uid>.com.apple.universalcontrol.inputstate`. While the pointer is on another Mac, uc-steer drops
-  the input events SteerMouse posts and sends them to the other Macs, and the Mac with the pointer posts them.
-  If Apple removes that notification, forwarding stops and actions run where the mouse is connected.
+- SteerMouse reads some buttons from the mouse itself (the MX Master's gesture button, over Logitech's HID++
+  protocol), posts them as ordinary button events for that mouse, and maps those in its event tap. That happens
+  on the Mac the mouse is connected to, wherever the pointer is. Universal Control publishes where the pointer is
+  in an undocumented notification, `user.uid.<uid>.com.apple.universalcontrol.inputstate`. While the pointer is
+  on another Mac, uc-steer takes those button events before SteerMouse maps them and sends them to the other
+  Macs. If Apple removes that notification, forwarding stops and the buttons act where the mouse is connected.
 
 ## Check
 

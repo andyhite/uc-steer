@@ -6,11 +6,11 @@
 // no IORegistry entry, so SteerMouse lets that input through untouched. uc-steer catches it, finds the
 // SteerMouse settings for that device, and applies them itself.
 //
-// Buttons Universal Control never sees: SteerMouse reads some buttons from the mouse directly (the MX Master's
-// gesture button, over Logitech's HID++ protocol) and performs their action on the Mac the mouse is connected
-// to, wherever the pointer is. While the pointer is on another Mac, uc-steer drops the input events SteerMouse
-// posts for those actions and sends them to uc-steer on your other Macs (Peers.swift). The Mac with the pointer
-// posts them.
+// Buttons Universal Control never sees: SteerMouse reads some buttons from the mouse itself (the MX Master's
+// gesture button, over Logitech's HID++ protocol), posts them as ordinary button events for that mouse, and maps
+// those in its event tap, on the Mac the mouse is connected to, wherever the pointer is. While the pointer is on
+// another Mac, uc-steer takes those button events before SteerMouse maps them and sends them to uc-steer on your
+// other Macs (Peers.swift). The Mac with the pointer applies its own SteerMouse settings to them.
 
 import AppKit
 import CoreData
@@ -216,12 +216,18 @@ func pointerIsHere() -> Bool {
 
 // MARK: Actions
 
-// Presses the shortcut assigned to a system symbolic hotkey (Mission Control and friends), turning the shortcut on
-// for the moment if it's off. False if it has no shortcut.
-func pressSymbolicHotKey(_ hotKey: Int32) -> Bool {
+func perform(_ action: [String: Any]) -> Bool {
+    let (name, hotKey) = describe(action)
+    guard let hotKey else {
+        logOnce("SteerMouse action \"\(name)\" isn't supported; passing the click through")
+        return false
+    }
     var character: UInt16 = 0, keyCode: UInt16 = 0
     var modifiers: UInt64 = 0  // 64-bit and zeroed: reads right whether SkyLight writes 32 or 64 bits
-    guard CGSGetSymbolicHotKeyValue(hotKey, &character, &keyCode, &modifiers) == 0, keyCode != 0xFFFF else { return false }
+    guard CGSGetSymbolicHotKeyValue(hotKey, &character, &keyCode, &modifiers) == 0, keyCode != 0xFFFF else {
+        logOnce("\"\(name)\" has no shortcut in System Settings > Keyboard > Keyboard Shortcuts > Mission Control")
+        return false
+    }
     let enabled = CGSIsSymbolicHotKeyEnabled(hotKey)
     if !enabled { _ = CGSSetSymbolicHotKeyEnabled(hotKey, true) }
     for down in [true, false] {
@@ -230,56 +236,15 @@ func pressSymbolicHotKey(_ hotKey: Int32) -> Bool {
         key?.post(tap: .cghidEventTap)
     }
     if !enabled { DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { _ = CGSSetSymbolicHotKeyEnabled(hotKey, false) } }
-    return true
-}
-
-func hotKeyName(_ hotKey: Int32) -> String { missionOps.first { $0.value == hotKey }?.key ?? "system shortcut \(hotKey)" }
-
-func perform(_ action: [String: Any]) -> Bool {
-    let (name, hotKey) = describe(action)
-    guard let hotKey else {
-        logOnce("SteerMouse action \"\(name)\" isn't supported; passing the click through")
-        return false
-    }
-    guard pressSymbolicHotKey(hotKey) else {
-        logOnce("\"\(name)\" has no shortcut in System Settings > Keyboard > Keyboard Shortcuts > Mission Control")
-        return false
-    }
     log(name)
     return true
 }
 
-// MARK: Forwarding SteerMouse actions
+// MARK: Forwarding SteerMouse's buttons
 
+// Each message to another Mac: the mouse's vendor and product ID (big-endian UInt16 each), then a serialized
+// button event.
 let peers = Peers()
-var forwardsActions = false  // a pairing key is set; the tap then also watches keyboard and click events
-
-// Event types SteerMouse posts for actions: keystrokes, clicks, scrolling, and 14, system-defined (media keys).
-let actionTypes = Set([CGEventType.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp, .rightMouseDown,
-                       .rightMouseUp, .otherMouseDown, .otherMouseUp, .scrollWheel].map(\.rawValue) + [14])
-let pressTypes: Set<CGEventType> = [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]  // one log line each
-
-// Messages to other Macs: a tag byte, then either the sending mouse's vendor and product ID (2 bytes each) and a
-// serialized CGEvent, or a symbolic hotkey ID (Int32). Numbers are big-endian.
-let eventMessage: UInt8 = 0, hotKeyMessage: UInt8 = 1
-
-// System shortcuts SteerMouse can press: Mission Control, Application Windows, Desktop, Dashboard, Move Left and
-// Right a Space (each with its slow-motion variant), Launchpad, Notification Center.
-let symbolicHotKeys: [Int32] = [32, 34, 33, 35, 36, 37, 62, 63, 79, 80, 81, 82, 160, 163]
-
-// SteerMouse presses those shortcuts by binding shortcut N to key code N + 200 (no modifiers) for the moment, so
-// forwarding the keystroke would do nothing on the other Mac. Returns the shortcut the keystroke triggers here.
-func symbolicHotKey(for event: CGEvent) -> Int32? {
-    let modifierMask: UInt64 = 0x1F0000  // caps lock, shift, control, option, command
-    let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
-    let modifiers = event.flags.rawValue & modifierMask
-    return symbolicHotKeys.first { hotKey in
-        if keyCode == UInt16(hotKey + 200) && modifiers == 0 { return true }  // SteerMouse may restore the binding first
-        var character: UInt16 = 0, code: UInt16 = 0, mods: UInt64 = 0
-        return CGSGetSymbolicHotKeyValue(hotKey, &character, &code, &mods) == 0 && code == keyCode
-            && mods & modifierMask == modifiers && CGSIsSymbolicHotKeyEnabled(hotKey)
-    }
-}
 
 var steerMouseProcesses: [Int64: Bool] = [:]
 func isSteerMouse(_ pid: Int64) -> Bool {
@@ -289,23 +254,13 @@ func isSteerMouse(_ pid: Int64) -> Bool {
     return result
 }
 
-// Sends an action SteerMouse posted to the other Macs, while the pointer is on one of them. True: drop it here.
+// Sends a button event SteerMouse posted to the other Macs, while the pointer is on one of them. True: drop it.
 func forward(_ type: CGEventType, _ event: CGEvent) -> Bool {
     let pid = event.getIntegerValueField(.eventSourceUnixProcessID)
-    guard pid > 0, actionTypes.contains(type.rawValue), peers.isConnected, !pointerIsHere(), isSteerMouse(pid)
-    else { return false }
-    if type == .keyDown || type == .keyUp, let hotKey = symbolicHotKey(for: event) {
-        // The other Mac presses and releases its own shortcut for it on key down.
-        if type == .keyDown, event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
-            peers.send(Data([hotKeyMessage]) + withUnsafeBytes(of: hotKey.bigEndian) { Data($0) })
-            log("sent \(hotKeyName(hotKey)) to the Mac with the pointer")
-        }
-        return true
-    }
-    guard let data = event.data as Data? else { return false }
-    // The mouse SteerMouse acted for, so the other Mac can apply its own settings for that mouse.
-    let id = deviceID(sender: event.getIntegerValueField(senderField))
-    var message = Data([eventMessage])
+    guard type == .otherMouseDown || type == .otherMouseUp, pid > 0, peers.isConnected, !pointerIsHere(),
+          isSteerMouse(pid), let data = event.data as Data? else { return false }
+    let id = deviceID(sender: event.getIntegerValueField(senderField))  // the mouse SteerMouse posted it for
+    var message = Data()
     for value in [id?.vendor ?? 0, id?.product ?? 0] {
         message += withUnsafeBytes(of: UInt16(truncatingIfNeeded: value).bigEndian) { Data($0) }
     }
@@ -313,54 +268,38 @@ func forward(_ type: CGEventType, _ event: CGEvent) -> Bool {
     if type == .otherMouseDown {
         let button = event.getIntegerValueField(.mouseEventButtonNumber) + 1
         log("sent button \(button) of \(id?.key ?? "an unknown mouse") to the Mac with the pointer")
-    } else if pressTypes.contains(type) {
-        log("sent a SteerMouse action to the Mac with the pointer")
     }
     return true
 }
 
-// Performs an action another Mac forwarded, if the pointer is on this Mac.
+// Applies a button another Mac forwarded, if the pointer is on this Mac: this Mac's SteerMouse settings for that
+// mouse, as for clicks from Universal Control, or a plain click when it has no supported action.
 func replay(_ message: Data) {
-    guard pointerIsHere(), let tag = message.first else { return }
-    let body = message.dropFirst()
-    if tag == hotKeyMessage, body.count == 4 {
-        let hotKey = body.reduce(Int32(0)) { $0 << 8 | Int32($1) }
-        guard symbolicHotKeys.contains(hotKey) else { return }
-        if pressSymbolicHotKey(hotKey) {
-            log("\(hotKeyName(hotKey)), from another Mac")
-        } else {
-            logOnce("\(hotKeyName(hotKey)) from another Mac has no shortcut in System Settings > Keyboard > Keyboard Shortcuts")
-        }
-    } else if tag == eventMessage, body.count > 4,
-              let event = CGEvent(withDataAllocator: nil, data: Data(body.dropFirst(4)) as CFData),
-              actionTypes.contains(event.type.rawValue), let now = CGEvent(source: nil) {
-        let b = Array(body.prefix(4))
-        let id = DeviceID(vendor: Int(b[0]) << 8 | Int(b[1]), product: Int(b[2]) << 8 | Int(b[3]))
-        let button = event.getIntegerValueField(.mouseEventButtonNumber)
-        // SteerMouse turns buttons it reads itself, like the MX Master's gesture button, into ordinary button
-        // events for the mouse. Apply this Mac's settings for that mouse, as for clicks from Universal Control.
-        if event.type == .otherMouseDown {
-            reloadSettingsIfChanged()
-            if let action = settings(for: id)?.actions[1 << Int(button)], perform(action) {
-                handledButtons.insert(button)
-                return
-            }
-            logOnce("button \(button + 1) of \(id.key) from another Mac has no supported SteerMouse action here; passing it through")
-        } else if event.type == .otherMouseUp, handledButtons.remove(button) != nil {
+    guard pointerIsHere(), message.count > 4,
+          let event = CGEvent(withDataAllocator: nil, data: Data(message.dropFirst(4)) as CFData),
+          event.type == .otherMouseDown || event.type == .otherMouseUp, let now = CGEvent(source: nil) else { return }
+    let b = Array(message.prefix(4))
+    let id = DeviceID(vendor: Int(b[0]) << 8 | Int(b[1]), product: Int(b[2]) << 8 | Int(b[3]))
+    let button = event.getIntegerValueField(.mouseEventButtonNumber)
+    if event.type == .otherMouseDown {
+        reloadSettingsIfChanged()
+        if let action = settings(for: id)?.actions[1 << Int(button)], perform(action) {
+            handledButtons.insert(button)
             return
         }
-        event.location = now.location  // the other Mac's pointer position means nothing here
-        event.timestamp = now.timestamp
-        event.setIntegerValueField(senderField, value: 0)  // a registry ID on the other Mac; must not match a device here
-        event.post(tap: .cghidEventTap)
-        if pressTypes.contains(event.type) { log("performed a SteerMouse action from another Mac") }
+        logOnce("button \(button + 1) of \(id.key) from another Mac has no supported SteerMouse action here; passing it through")
+    } else if handledButtons.remove(button) != nil {
+        return
     }
+    event.location = now.location  // the other Mac's pointer position means nothing here
+    event.timestamp = now.timestamp
+    event.setIntegerValueField(senderField, value: 0)  // a registry ID on the other Mac; must not match a device here
+    event.post(tap: .cghidEventTap)
 }
 
 // MARK: Event tap
 
 var tap: CFMachPort?
-var tapSource: CFRunLoopSource?
 var handledButtons = Set<Int64>()  // presses uc-steer performed; their drags and release are dropped too
 
 // SteerMouse settings for the Universal Control device that sent the event, if any.
@@ -380,7 +319,7 @@ func flip(_ event: CGEvent, _ line: CGEventField, _ fixed: CGEventField, _ point
 
 // Returns true to drop the event.
 func handle(_ type: CGEventType, _ event: CGEvent) -> Bool {
-    if forwardsActions, forward(type, event) { return true }
+    if forward(type, event) { return true }
     let button = event.getIntegerValueField(.mouseEventButtonNumber)
     switch type {
     case .scrollWheel:
@@ -405,13 +344,9 @@ func handle(_ type: CGEventType, _ event: CGEvent) -> Bool {
     }
 }
 
-// (Re)creates the event tap. Call it again after forwardsActions changes.
 func startTap() {
-    if let tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), tapSource, .commonModes) }
-    if let tap { CFMachPortInvalidate(tap) }
-    var types = Set([CGEventType.otherMouseDown, .otherMouseUp, .otherMouseDragged, .scrollWheel].map(\.rawValue))
-    if forwardsActions { types.formUnion(actionTypes) }
-    let mask = types.reduce(CGEventMask(0)) { $0 | CGEventMask(1) << $1 }
+    let types: [CGEventType] = [.otherMouseDown, .otherMouseUp, .otherMouseDragged, .scrollWheel]
+    let mask = types.reduce(CGEventMask(0)) { $0 | CGEventMask(1) << $1.rawValue }
     tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
                             eventsOfInterest: mask, callback: { _, type, event, _ in
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -420,11 +355,10 @@ func startTap() {
         }
         return handle(type, event) ? nil : Unmanaged.passUnretained(event)
     }, userInfo: nil)
-    guard let tap else { tapSource = nil; log("can't create the event tap"); return }
-    tapSource = CFMachPortCreateRunLoopSource(nil, tap, 0)
-    CFRunLoopAddSource(CFRunLoopGetMain(), tapSource, .commonModes)
+    guard let tap else { log("can't create the event tap"); return }
+    CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
     reloadSettingsIfChanged()
-    log("watching Universal Control input" + (forwardsActions ? " and SteerMouse actions" : ""))
+    log("watching Universal Control input and SteerMouse's buttons")
 }
 
 // MARK: Check

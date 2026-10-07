@@ -37,19 +37,13 @@ enum PairingKey {
 
 var pairingKey = PairingKey.read()
 
-func applyPairingKey() {
-    peers.start(key: pairingKey)
-    forwardsActions = pairingKey != nil
-    if tap != nil { startTap() }  // adds or removes keyboard and click events
-}
-
 func editPairingKey() {
     let alert = NSAlert()
     alert.messageText = "Pairing Key"
     alert.informativeText = """
-        uc-steer sends SteerMouse actions for buttons Universal Control doesn't forward, like the MX Master's \
-        gesture button, to your other Macs that use this key. Copy it into uc-steer on each of them, or paste \
-        the key from another Mac. Clear it to turn forwarding off.
+        uc-steer sends buttons Universal Control doesn't forward, like the MX Master's gesture button, to your \
+        other Macs that use this key. Copy it into uc-steer on each of them, or paste the key from another Mac. \
+        Clear it to turn forwarding off.
         """
     let field = NSTextField(string: pairingKey ?? PairingKey.generate())
     field.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
@@ -62,7 +56,7 @@ func editPairingKey() {
     let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
     pairingKey = key.isEmpty ? nil : key
     PairingKey.save(pairingKey)
-    applyPairingKey()
+    peers.start(key: pairingKey)
 }
 
 func toggleStartAtLogin() {
@@ -173,7 +167,7 @@ app.mainMenu?.addItem(withTitle: "Edit", action: nil, keyEquivalent: "").submenu
 let statusMenu = StatusMenu()
 
 peers.onMessage = replay
-applyPairingKey()
+peers.start(key: pairingKey)
 
 let prompt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
 if AXIsProcessTrustedWithOptions(prompt) {
