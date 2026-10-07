@@ -212,18 +212,12 @@ func pointerIsHere() -> Bool {
 
 // MARK: Actions
 
-func perform(_ action: [String: Any]) -> Bool {
-    let (name, hotKey) = describe(action)
-    guard let hotKey else {
-        logOnce("SteerMouse action \"\(name)\" isn't supported; passing the click through")
-        return false
-    }
+// Presses the shortcut assigned to a system symbolic hotkey (Mission Control and friends), turning the shortcut on
+// for the moment if it's off. False if it has no shortcut.
+func pressSymbolicHotKey(_ hotKey: Int32) -> Bool {
     var character: UInt16 = 0, keyCode: UInt16 = 0
     var modifiers: UInt64 = 0  // 64-bit and zeroed: reads right whether SkyLight writes 32 or 64 bits
-    guard CGSGetSymbolicHotKeyValue(hotKey, &character, &keyCode, &modifiers) == 0, keyCode != 0xFFFF else {
-        logOnce("\"\(name)\" has no shortcut in System Settings > Keyboard > Keyboard Shortcuts > Mission Control")
-        return false
-    }
+    guard CGSGetSymbolicHotKeyValue(hotKey, &character, &keyCode, &modifiers) == 0, keyCode != 0xFFFF else { return false }
     let enabled = CGSIsSymbolicHotKeyEnabled(hotKey)
     if !enabled { _ = CGSSetSymbolicHotKeyEnabled(hotKey, true) }
     for down in [true, false] {
@@ -232,6 +226,21 @@ func perform(_ action: [String: Any]) -> Bool {
         key?.post(tap: .cghidEventTap)
     }
     if !enabled { DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { _ = CGSSetSymbolicHotKeyEnabled(hotKey, false) } }
+    return true
+}
+
+func hotKeyName(_ hotKey: Int32) -> String { missionOps.first { $0.value == hotKey }?.key ?? "system shortcut \(hotKey)" }
+
+func perform(_ action: [String: Any]) -> Bool {
+    let (name, hotKey) = describe(action)
+    guard let hotKey else {
+        logOnce("SteerMouse action \"\(name)\" isn't supported; passing the click through")
+        return false
+    }
+    guard pressSymbolicHotKey(hotKey) else {
+        logOnce("\"\(name)\" has no shortcut in System Settings > Keyboard > Keyboard Shortcuts > Mission Control")
+        return false
+    }
     log(name)
     return true
 }
@@ -246,6 +255,26 @@ let actionTypes = Set([CGEventType.keyDown, .keyUp, .flagsChanged, .leftMouseDow
                        .rightMouseUp, .otherMouseDown, .otherMouseUp, .scrollWheel].map(\.rawValue) + [14])
 let pressTypes: Set<CGEventType> = [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]  // one log line each
 
+// Messages to other Macs: a tag byte, then a serialized CGEvent, or a symbolic hotkey ID (big-endian Int32).
+let eventMessage: UInt8 = 0, hotKeyMessage: UInt8 = 1
+
+// System shortcuts SteerMouse can press: Mission Control, Application Windows, Desktop, Dashboard, Move Left and
+// Right a Space (each with its slow-motion variant), Launchpad, Notification Center.
+let symbolicHotKeys: [Int32] = [32, 34, 33, 35, 36, 37, 62, 63, 79, 80, 81, 82, 160, 163]
+
+// SteerMouse presses those shortcuts by binding them to a private key combination for the moment, so forwarding
+// the keystroke would do nothing on the other Mac. Returns the shortcut the keystroke triggers here, if any.
+func symbolicHotKey(for event: CGEvent) -> Int32? {
+    let modifierMask: UInt64 = 0x1F0000  // caps lock, shift, control, option, command
+    let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+    let modifiers = event.flags.rawValue & modifierMask
+    return symbolicHotKeys.first { hotKey in
+        var character: UInt16 = 0, code: UInt16 = 0, mods: UInt64 = 0
+        return CGSGetSymbolicHotKeyValue(hotKey, &character, &code, &mods) == 0 && code == keyCode
+            && mods & modifierMask == modifiers && CGSIsSymbolicHotKeyEnabled(hotKey)
+    }
+}
+
 var steerMouseProcesses: [Int64: Bool] = [:]
 func isSteerMouse(_ pid: Int64) -> Bool {
     if let known = steerMouseProcesses[pid] { return known }
@@ -254,25 +283,45 @@ func isSteerMouse(_ pid: Int64) -> Bool {
     return result
 }
 
-// Sends an event SteerMouse posted to the other Macs, while the pointer is on one of them. True: drop it here.
+// Sends an action SteerMouse posted to the other Macs, while the pointer is on one of them. True: drop it here.
 func forward(_ type: CGEventType, _ event: CGEvent) -> Bool {
     let pid = event.getIntegerValueField(.eventSourceUnixProcessID)
-    guard pid > 0, actionTypes.contains(type.rawValue), peers.isConnected, !pointerIsHere(), isSteerMouse(pid),
-          let data = event.data as Data? else { return false }
-    peers.send(data)
+    guard pid > 0, actionTypes.contains(type.rawValue), peers.isConnected, !pointerIsHere(), isSteerMouse(pid)
+    else { return false }
+    if type == .keyDown || type == .keyUp, let hotKey = symbolicHotKey(for: event) {
+        // The other Mac presses and releases its own shortcut for it on key down.
+        if type == .keyDown, event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+            peers.send(Data([hotKeyMessage]) + withUnsafeBytes(of: hotKey.bigEndian) { Data($0) })
+            log("sent \(hotKeyName(hotKey)) to the Mac with the pointer")
+        }
+        return true
+    }
+    guard let data = event.data as Data? else { return false }
+    peers.send(Data([eventMessage]) + data)
     if pressTypes.contains(type) { log("sent a SteerMouse action to the Mac with the pointer") }
     return true
 }
 
-// Posts an event another Mac forwarded, if the pointer is on this Mac.
-func replay(_ data: Data) {
-    guard pointerIsHere(), let event = CGEvent(withDataAllocator: nil, data: data as CFData),
-          actionTypes.contains(event.type.rawValue), let now = CGEvent(source: nil) else { return }
-    event.location = now.location  // the other Mac's pointer position means nothing here
-    event.timestamp = now.timestamp
-    event.setIntegerValueField(senderField, value: 0)  // a registry ID on the other Mac; must not match a device here
-    event.post(tap: .cghidEventTap)
-    if pressTypes.contains(event.type) { log("performed a SteerMouse action from another Mac") }
+// Performs an action another Mac forwarded, if the pointer is on this Mac.
+func replay(_ message: Data) {
+    guard pointerIsHere(), let tag = message.first else { return }
+    let body = message.dropFirst()
+    if tag == hotKeyMessage, body.count == 4 {
+        let hotKey = body.reduce(Int32(0)) { $0 << 8 | Int32($1) }
+        guard symbolicHotKeys.contains(hotKey) else { return }
+        if pressSymbolicHotKey(hotKey) {
+            log("\(hotKeyName(hotKey)), from another Mac")
+        } else {
+            logOnce("\(hotKeyName(hotKey)) from another Mac has no shortcut in System Settings > Keyboard > Keyboard Shortcuts")
+        }
+    } else if tag == eventMessage, let event = CGEvent(withDataAllocator: nil, data: Data(body) as CFData),
+              actionTypes.contains(event.type.rawValue), let now = CGEvent(source: nil) {
+        event.location = now.location  // the other Mac's pointer position means nothing here
+        event.timestamp = now.timestamp
+        event.setIntegerValueField(senderField, value: 0)  // a registry ID on the other Mac; must not match a device here
+        event.post(tap: .cghidEventTap)
+        if pressTypes.contains(event.type) { log("performed a SteerMouse action from another Mac") }
+    }
 }
 
 // MARK: Event tap

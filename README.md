@@ -55,8 +55,10 @@ mouse connects to this Mac differently (Bluetooth instead of a receiver), choose
 - Button actions from SteerMouse's Mission Control group: Mission Control, Application Windows, Desktop,
   Move Left a Space, Move Right a Space. Other actions pass through as plain clicks.
 - Scroll direction, when SteerMouse reverses both directions of a wheel.
-- Forwarded actions that SteerMouse performs with keystrokes, clicks or scrolling. A forwarded shortcut does
-  whatever that shortcut does on the receiving Mac.
+- Forwarded actions. Mission Control actions run as the same action on the receiving Mac, which needs a keyboard
+  shortcut for it in System Settings > Keyboard > Keyboard Shortcuts (Mission Control, Application Windows,
+  Desktop and Move Left/Right a Space have one by default). Keystroke, click and scroll actions are replayed
+  as they are.
 
 Not applied: scroll speed, cursor speed, per-app settings, modifier+button combinations, and forwarded actions
 that SteerMouse performs another way, like opening an app or a URL. Those still run on the Mac the mouse is
