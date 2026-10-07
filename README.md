@@ -24,8 +24,9 @@ Needs macOS 13 or later, SteerMouse, and Xcode or the Command Line Tools (`swift
    Certificate…, Name `uc-steer dev`, Identity Type Self-Signed Root, Certificate Type Code Signing. Without it,
    builds are signed ad hoc and macOS asks for permissions again after every reinstall. To use a certificate
    with another name, run `CODESIGN_IDENTITY="name" ./install.sh`.
-2. Run `./install.sh`. It builds `uc-steer.app`, copies it to `/Applications` and opens it. If a keychain
-   dialog asks to let codesign use the key, click Always Allow.
+2. `git clone https://github.com/andyhite/uc-steer.git && uc-steer/install.sh`. The script builds
+   `uc-steer.app`, copies it to `/Applications` and opens it. If a keychain dialog asks to let codesign use the
+   key, click Always Allow. To update later, run `git pull && ./install.sh` in the `uc-steer` folder.
 3. Allow uc-steer in System Settings > Privacy & Security > Accessibility.
 4. In the menu bar icon (a mouse), turn on Start at Login.
 
