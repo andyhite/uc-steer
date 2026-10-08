@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Network
 import CryptoKit
@@ -30,7 +31,37 @@ final class Peers {
     private var states: [String: String] = [:]
     private var pending: Set<String> = []
 
-    init(name: String? = nil) { self.name = name }
+    private var monitor = NWPathMonitor()
+    private var lastPath: String?
+    private var restartWork: DispatchWorkItem?
+
+    init(name: String? = nil) {
+        self.name = name
+        // After sleep, Bonjour registration, browse results and sockets are stale; rebuild once the network settles.
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.scheduleRestart("wake")
+        }
+        monitor.pathUpdateHandler = { [weak self] p in
+            let sig = "\(p.status) \(p.availableInterfaces.map(\.name).sorted())"
+            guard let self, sig != self.lastPath else { return }
+            let first = self.lastPath == nil
+            self.lastPath = sig
+            if !first { self.scheduleRestart("network change") }
+        }
+        monitor.start(queue: .main)
+    }
+
+    /// Debounced: wake and path events arrive in bursts while Wi-Fi reassociates.
+    private func scheduleRestart(_ why: String) {
+        restartWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self, let key = self.key else { return }
+            log("peers: restarting after \(why)")
+            self.start(key: key)
+        }
+        restartWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: w)
+    }
 
     func start(key: String?) {
         stop()
