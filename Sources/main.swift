@@ -164,6 +164,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             })
         }
         menu.addItem(menuItem("Start at Login", checked: SMAppService.mainApp.status == .enabled, action: toggleStartAtLogin))
+        menu.addItem(.separator())
+        menu.addItem(menuItem("Debug Logging", checked: debugLogging) { debugLogging.toggle() })
+        menu.addItem(menuItem("Log Diagnostics") {
+            log("diagnostics: requested from running menu app")
+            check()
+            peers.logDiagnostics()
+        })
         menu.addItem(menuItem("Quit uc-steer") { NSApp.terminate(nil) })
     }
 
@@ -190,6 +197,7 @@ if CommandLine.arguments.contains("--check") { check(); exit(0) }
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+log("app: starting pid=\(getpid()) version=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unbundled") build=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown") os=\(ProcessInfo.processInfo.operatingSystemVersionString) accessibility=\(AXIsProcessTrusted()) debug=\(debugLogging)")
 // Without a main menu, the pairing key field gets no ⌘X/⌘C/⌘V/⌘A.
 let editMenu = NSMenu(title: "Edit")
 editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
@@ -198,6 +206,7 @@ editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEqu
 editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
 app.mainMenu = NSMenu()
 app.mainMenu?.addItem(withTitle: "Edit", action: nil, keyEquivalent: "").submenu = editMenu
+startInputDevices() // Prime metadata before the tap; subsequent HID reads run off the event callback.
 let statusMenu = StatusMenu()
 
 peers.onMessage = { replay($0, from: $1) }
@@ -206,6 +215,11 @@ reloadPairingKey()
 let terminationObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
                                                                  object: app, queue: .main) { _ in
     peers.start(key: nil) // Release replayed clicks before exiting; remote peers clean up on EOF.
+}
+let inputWakeObservers = [NSWorkspace.didWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification].map { name in
+    NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { _ in
+        invalidateInputDevices(name.rawValue)
+    }
 }
 
 let prompt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary

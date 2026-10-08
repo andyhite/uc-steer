@@ -163,6 +163,86 @@ struct InputChecks {
         assert(loads == 4 && devices.isEmpty)
         mtime = good; fail = false; clock += 10_000_000_000; reload()
         assert(loads == 5 && devices.count == 1)
+
+        // HID snapshots: deterministic clock and reads; no live IOKit.
+        var hidNow: UInt64 = 5_000_000_000
+        var hid: [HIDService]? = []
+        inputNow = { hidNow }; inputRead = { hid }
+        func mouse(_ id: UInt64, _ v: Int?, _ p: Int?, _ name: String?) -> HIDService {
+            HIDService(registryID: id, vendor: v, product: p, name: name, transport: "USB", usagePage: Int(kHIDPage_GenericDesktop),
+                       usage: Int(kHIDUsage_GD_Mouse), virtual: true)
+        }
+        // Missing IDs are never a 0000:0000 device; a later read recovers them.
+        hid = [mouse(700, nil, nil, nil)]; invalidateInputDevices("check")
+        assert(remoteDevice(sender: 700) == nil && deviceID(sender: 700) == nil && remoteMice().isEmpty)
+        hid = [mouse(700, 1, nil, "V-M")]; hidNow += 2_000_000_000
+        assert(remoteDevice(sender: 700) == nil && remoteMice().isEmpty)
+        hid = [mouse(700, 1, 2, "V-M")]
+        hidNow += 500_000_000
+        assert(remoteDevice(sender: 700) == nil) // cached for under a second
+        hidNow += 1_500_000_000
+        assert(remoteDevice(sender: 700) == id12 && deviceID(sender: 700) == id12)
+        // Removed senders disappear, then reconnect.
+        hid = []; hidNow += 500_000_000
+        assert(remoteDevice(sender: 700) == id12)
+        hidNow += 1_000_000_000
+        assert(remoteDevice(sender: 700) == nil && remoteMice().isEmpty)
+        hid = [mouse(700, 1, 2, "V-M")]; hidNow += 2_000_000_000
+        assert(remoteDevice(sender: 700) == id12)
+        // A failed read fails closed (no stale identity); the next successful read recovers.
+        hid = nil; hidNow += 2_000_000_000
+        assert(remoteDevice(sender: 700) == nil && inputUnavailable)
+        hid = [mouse(700, 1, 2, "V-M")]; hidNow += 500_000_000
+        assert(remoteDevice(sender: 700) == nil) // retry throttled to one second
+        hidNow += 1_000_000_000
+        assert(remoteDevice(sender: 700) == id12 && !inputUnavailable)
+        hid = []; invalidateInputDevices("check")
+        assert(remoteDevice(sender: 700) == nil)
+        // Duplicate VID/PID: a missing name never replaces a known one; no name at all is truthful.
+        hid = [mouse(1, 1, 2, nil), mouse(2, 1, 2, "V-M"), mouse(3, 1, 2, nil), mouse(4, nil, 9, "X")]; hidNow += 2_000_000_000
+        assert(remoteMice().map(\.name) == ["M"] && remoteMice()[0].id == id12)
+        hid = [mouse(1, 1, 2, nil)]; hidNow += 2_000_000_000
+        assert(remoteMice().map(\.name) == ["Unknown mouse (0001:0002)"])
+
+        // Forwarding: an unresolved sender stays local; a resolved one sends the real VID/PID, and the route owns the release.
+        var wire: [Data] = []
+        var g = ButtonEffects()
+        g.destination = { "peer-id" }
+        g.connection = { _ in route2 }
+        g.send = { data, to in wire.append(data); return to }
+        g.pointerHere = { false }
+        g.steerMouse = { $0 > 0 }
+        g.device = { deviceID(sender: $0) }
+        hid = [mouse(700, nil, nil, nil)]; invalidateInputDevices("check")
+        assert(!forward(.otherMouseDown, event(.otherMouseDown, sender: 700, pid: 10), g))
+        assert(wire.isEmpty && forwardedButtons.isEmpty)
+        hid = [mouse(700, 0x046d, 0xb034, "V-M")]; hidNow += 2_000_000_000
+        assert(forward(.otherMouseDown, event(.otherMouseDown, sender: 700, pid: 10), g))
+        func wireID(_ d: Data) -> DeviceID { DeviceID(vendor: Int(d[4]) << 8 | Int(d[5]), product: Int(d[6]) << 8 | Int(d[7])) }
+        let logi = DeviceID(vendor: 0x046d, product: 0xb034)
+        assert(wire.count == 1 && wireID(wire[0]) == logi && forwardedButtons[remote]?.device == logi)
+        hid = []; hidNow += 2_000_000_000 // sender gone: the release keeps its original route and device
+        assert(forward(.otherMouseUp, event(.otherMouseUp, sender: 700, pid: 10), g))
+        assert(wire.count == 2 && wireID(wire[1]) == logi && forwardedButtons.isEmpty)
+
+        // Background refresh: lookups never read; stale or invalidated snapshots fail closed; pre-invalidation results are discarded.
+        inputBackground = true; inputSchedule = { _ in }; inputReadInFlight = false
+        hid = [mouse(700, 1, 2, "V-M")]
+        finishInputRead(hid, generation: inputGeneration, started: hidNow)
+        assert(remoteDevice(sender: 700) == id12)
+        hidNow += 2_500_000_000
+        assert(remoteDevice(sender: 700) == nil)
+        finishInputRead(hid, generation: inputGeneration, started: hidNow)
+        assert(remoteDevice(sender: 700) == id12)
+        let before = inputGeneration
+        invalidateInputDevices("check")
+        assert(remoteDevice(sender: 700) == nil)
+        finishInputRead(hid, generation: before, started: hidNow)
+        assert(remoteDevice(sender: 700) == nil)
+        inputReadInFlight = false
+        finishInputRead(hid, generation: inputGeneration, started: hidNow)
+        assert(remoteDevice(sender: 700) == id12)
+        inputBackground = false
         print("Input ownership checks passed")
     }
 }

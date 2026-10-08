@@ -82,11 +82,27 @@ It does **not** apply left/right-button mappings, scroll or cursor speed, per-ap
 
 Temporary SteerMouse settings read failures retry on the next relevant input or menu refresh, at most once per second, even if the settings file has not changed.
 
-**Inspect settings and detected mice:**
+**If device names disappear or controls stop:** Mouse names and vendor/product IDs come from macOS HID services. Older versions displayed missing metadata as `?`, permanently cached failed sender lookups, and could forward an unresolved device as `0000:0000`. The app now reads fresh HID clients into value snapshots about once a second, off the input callback, and invalidates them on wake/session activation. Failed or over-two-second-old snapshots are not used for input matching. A newly unresolved gesture stays local rather than being forwarded with an invented identity; it can work again once metadata returns. A missing name alone is shown as `Unknown mouse (vendor:product)`, and cannot replace a known name from another service for the same device.
+
+**Capture an intermittent failure on both Macs:**
+
+1. Enable **Debug Logging** in each menu before reproducing the problem. The setting persists across restarts.
+2. When it happens, choose **Log Diagnostics** on each Mac **before restarting**. This records the running app's cached device data before a fresh read, raw HID metadata, settings mappings, permissions, event-tap and Universal Control input state, owned presses, and peer connections.
+3. Save the recent history on each Mac, label which Mac it came from, and note the failure time and any preceding sleep, reconnect, or device switch:
+
+   ```sh
+   log show --last 30m --style compact --predicate 'subsystem == "com.andyhite.uc-steer"' > ~/Desktop/uc-steer.log
+   ```
+
+Device changes, missing/recovered metadata, tap failures and connection teardown reasons are logged by default. Debug Logging adds button-routing decisions, profile matches, discovery and connection details; these are also retained in the normal macOS unified log, subject to macOS retention. It does not log keystroke content, pointer coordinates, device serial numbers, pairing keys, or raw network payloads. Logs do include device/peer names, IDs and diagnostic paths; review them before sharing. Disable Debug Logging after capture to reduce volume.
+
+**Inspect a fresh process's settings and detected mice:**
 
 ```sh
 /Applications/uc-steer.app/Contents/MacOS/uc-steer --check
 ```
+
+`--check` starts a separate process: it cannot see the running app's cached metadata, event tap, held presses, or connections. Use **Log Diagnostics** for those.
 
 **Stream logs:**
 
@@ -94,7 +110,7 @@ Temporary SteerMouse settings read failures retry on the next relevant input or 
 log stream --predicate 'subsystem == "com.andyhite.uc-steer"'
 ```
 
-**Run regression checks:** `sh test.sh`. This checks the entire production source set against the macOS 13 deployment target, input ownership/replay and profile recovery, disposable Keychain operations, loopback-only authenticated transport and resource limits, and sandboxed installer rollback. It does not install the app, post live mouse events, or verify multi-Mac hardware behavior.
+**Run regression checks:** `sh test.sh`. This checks the entire production source set against the macOS 13 deployment target, input ownership/replay, HID metadata loss/recovery and stale background-read invalidation, profile recovery, disposable Keychain operations, loopback-only authenticated transport and resource limits, and sandboxed installer rollback. It does not install the app, post live mouse events, or verify multi-Mac hardware behavior.
 
 **Uninstall:** Turn off **Start at Login**, run `./install.sh uninstall`, and remove uc-steer from **System Settings → Privacy & Security → Accessibility**.
 
