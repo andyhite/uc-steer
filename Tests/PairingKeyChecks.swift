@@ -22,11 +22,22 @@ struct Failure: Error { let what: String }
             SecKeychainSetUserInteractionAllowed(interaction.boolValue)
         }
 
-        try check(PairingKey.read() == nil, "starts empty")
+        try check(try PairingKey.read() == nil, "starts empty")
         try check(PairingKey.save(nil) == errSecSuccess, "clearing a missing item succeeds")
-        try check(PairingKey.save("AAAA") == errSecSuccess && PairingKey.read() == "AAAA", "add when missing")
-        try check(PairingKey.save("BBBB") == errSecSuccess && PairingKey.read() == "BBBB", "update existing")
-        try check(PairingKey.save(nil) == errSecSuccess && PairingKey.read() == nil, "clear removes it")
+        try check(PairingKey.save("AAAA") == errSecSuccess && (try PairingKey.read()) == "AAAA", "add when missing")
+        try check(PairingKey.save("BBBB") == errSecSuccess && (try PairingKey.read()) == "BBBB", "update existing")
+        try check(PairingKey.save(nil) == errSecSuccess && (try PairingKey.read()) == nil, "clear removes it")
+
+        try check(try PairingKey.decode(errSecItemNotFound, nil) == nil, "missing item is nil")
+        try check(try PairingKey.decode(errSecSuccess, Data("KEY".utf8) as CFData) == "KEY", "valid data decodes")
+        for status in [errSecAuthFailed, errSecInteractionNotAllowed, errSecNotAvailable] {
+            do { _ = try PairingKey.decode(status, nil); throw Failure(what: "status \(status) must throw") }
+            catch PairingKey.ReadError.keychain(let got) { try check(got == status, "status \(status) preserved") }
+        }
+        for bad: CFTypeRef? in [nil, Data([0xFF, 0xFE]) as CFData] {
+            do { _ = try PairingKey.decode(errSecSuccess, bad); throw Failure(what: "invalid data must throw") }
+            catch PairingKey.ReadError.invalidData {}
+        }
     }
 
     static func main() {

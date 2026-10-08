@@ -35,13 +35,13 @@ cd uc-steer
 ./install.sh
 ```
 
-The installer builds the app, places it in `/Applications`, and opens it.
+The installer builds the app, places it in `/Applications`, and opens it. It stops only your account's uc-steer processes and aborts if they do not quit within about ten seconds. Failed upgrades restore the previous app, even if rollback is interrupted again.
 
 1. Allow **uc-steer** in **System Settings → Privacy & Security → Accessibility**.
 2. Click the mouse icon in the menu bar and enable **Start at Login**.
 3. Configure your preferred actions in SteerMouse on each Mac. Each Mac uses its own settings—not a synced copy.
 
-Mouse profiles match automatically by vendor and product ID. If you use Bluetooth on one Mac and a receiver on another, choose the matching SteerMouse profile from the mouse's submenu.
+Mouse profiles match automatically by vendor and product ID. If you use Bluetooth on one Mac and a receiver on another, choose the matching SteerMouse profile from the mouse's submenu. Profiles with the same name show their device IDs and distinct numbers; selections remember the exact SteerMouse profile rather than its name.
 
 <details>
 <summary><strong>Optional: keep permissions across reinstalls</strong></summary>
@@ -61,7 +61,11 @@ For an existing certificate with another name, use `CODESIGN_IDENTITY="name" ./i
 
 **You choose the destination; it doesn't track the pointer.** Forwarding defaults to **Off**. Change the destination when switching Macs, and turn it **Off** for an iPad. If the selected Mac is unavailable, new presses stay local—another Mac is never substituted.
 
-Connections are encrypted over your local network. Keep the pairing key private: anyone with it can send mouse-button actions to your Macs.
+Destinations are remembered by a persistent peer identity exchanged inside the encrypted connection, not by the Mac's Bonjour name. Renaming a Mac preserves its selection; another Mac reusing that name does not take its place. If a forwarded release is missed, the next press releases the old route before being handled normally.
+
+Connections are encrypted over your local network. Keep the pairing key private: anyone with it can send mouse-button actions to your Macs. Stable identities prevent accidental name substitution; they are not separate credentials protecting against another holder of the same key. Each app accepts at most 32 incoming connections. Connections must complete the TLS/identity handshake within ten seconds, and each started frame must finish within ten seconds; healthy idle connections stay open.
+
+If the keychain cannot be read, the menu offers **Retry Pairing Key…** instead of generating a replacement. Unlock the login keychain or allow access, then retry; the saved key is not changed by a read failure.
 
 ## Know before you install
 
@@ -74,7 +78,9 @@ It does **not** apply left/right-button mappings, scroll or cursor speed, per-ap
 <details>
 <summary><strong>Updates, diagnostics & removal</strong></summary>
 
-**Update:** Run `git pull && ./install.sh` from the repository folder on every Mac. Keep all Macs on the same version; older broadcast-based versions cannot forward to current versions. Pairing keys are retained, but when upgrading from an older broadcast-based version, select a forwarding destination to enable forwarding.
+**Update:** Run `git pull && ./install.sh` from the repository folder on every Mac. Update all Macs together: versions without the identity handshake cannot forward to this version. Pairing keys are retained, but old name-only forwarding destinations reset to **Off**; select the intended Mac again once connected. Old profile-name overrides migrate only when the name identifies exactly one profile; ambiguous overrides reset to Automatic and should be selected again.
+
+Temporary SteerMouse settings read failures retry on the next relevant input or menu refresh, at most once per second, even if the settings file has not changed.
 
 **Inspect settings and detected mice:**
 
@@ -88,7 +94,7 @@ It does **not** apply left/right-button mappings, scroll or cursor speed, per-ap
 log stream --predicate 'subsystem == "com.andyhite.uc-steer"'
 ```
 
-**Run regression checks:** `sh test.sh`. These do not verify multi-Mac hardware behavior.
+**Run regression checks:** `sh test.sh`. This checks the entire production source set against the macOS 13 deployment target, input ownership/replay and profile recovery, disposable Keychain operations, loopback-only authenticated transport and resource limits, and sandboxed installer rollback. It does not install the app, post live mouse events, or verify multi-Mac hardware behavior.
 
 **Uninstall:** Turn off **Start at Login**, run `./install.sh uninstall`, and remove uc-steer from **System Settings → Privacy & Security → Accessibility**.
 

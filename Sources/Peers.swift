@@ -7,19 +7,58 @@ import Security
 /// Finds other Macs on the local network running uc-steer and exchanges messages with the ones using the same pairing key.
 /// Bonjour `_uc-steer._tcp`; TCP with TLS 1.2 using a pre-shared key derived from the pairing key; each message is a
 /// 4-byte big-endian length, then the payload. A Mac sends only on connections it opened, so each pair has one path per
-/// direction.
+/// direction. Each side's first frame, inside TLS, is a versioned hello carrying its persisted per-install UUID; a
+/// connection is routable and its frames accepted only after a valid hello from another identity. Bonjour names are
+/// for display and discovery only.
 final class Peers {
     /// Called with the sender connection's lifetime ID (incoming or outgoing).
     var onMessage: (Data, UUID) -> Void = { _, _ in }
     /// Called exactly once per connection, synchronously from stop/start or when it dies.
     var onDisconnect: (UUID) -> Void = { _ in }
-    /// Other Macs found, sorted by name, with a short state for the menu.
-    var status: [(name: String, state: String)] { found.keys.sorted().map { (name: $0, state: states[$0] ?? "connecting") } }
+    /// Other Macs found, sorted by name, with a short state for the menu. `id` is the peer's authenticated identity
+    /// UUID string, nil until its hello is verified.
+    var status: [(id: String?, name: String, state: String)] {
+        found.keys.sorted().map { n in
+            (id: outgoing[n].flatMap { ids[$0] }?.uuidString, name: n, state: states[n] ?? "connecting")
+        }
+    }
 
+    /// UserDefaults key of this install's persisted identity UUID.
+    static let identityKey = "peerIdentity"
     private static let type = "_uc-steer._tcp"
     private static let maxFrame = 65536
+    private static let helloPrefix = Data("UCSH".utf8) + Data([1])  // magic, version 1
+    private static let helloLength = 5 + 16
+
+    /// Limits: live incoming connections; seconds from connect to verified hello (covers a silent peer); seconds from a
+    /// frame's first byte to its last, fixed so trickling doesn't extend it. Verified idle connections never expire.
+    var maxIncoming = 32
+    var handshakeTimeout = 10.0
+    var frameTimeout = 10.0
+
+    /// Length-prefixed hello frame announcing `id`.
+    static func helloFrame(_ id: UUID) -> Data {
+        let hello = helloPrefix + withUnsafeBytes(of: id.uuid) { Data($0) }
+        return withUnsafeBytes(of: UInt32(hello.count).bigEndian) { Data($0) } + hello
+    }
+
+    private static func parseHello(_ d: Data) -> UUID? {
+        guard d.count == helloLength, d.prefix(helloPrefix.count) == helloPrefix else { return nil }
+        var bytes: uuid_t = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        withUnsafeMutableBytes(of: &bytes) { $0.copyBytes(from: d.suffix(16)) }
+        return UUID(uuid: bytes)
+    }
 
     private let name: String?
+    private let injectedID: UUID?
+    private lazy var ownID: UUID = {
+        if let injectedID { return injectedID }
+        let d = UserDefaults.standard
+        if let s = d.string(forKey: Peers.identityKey), let u = UUID(uuidString: s) { return u }
+        let u = UUID()
+        d.set(u.uuidString, forKey: Peers.identityKey)
+        return u
+    }()
     private var ownName: String?
     private var key: String?
     private var listener: NWListener?
@@ -30,13 +69,26 @@ final class Peers {
     private var outgoing: [String: UUID] = [:]     // peer name -> ID of the connection we opened
     private var states: [String: String] = [:]
     private var pending: Set<String> = []
+    private var ids: [UUID: UUID] = [:]            // connection ID -> peer identity, only once its hello verified
+    private var incoming: Set<UUID> = []
+    private var buffers: [UUID: Data] = [:]        // received bytes not yet forming a whole frame
+    private var handshakes: [UUID: DispatchWorkItem] = [:]
+    private var frameDeadlines: [UUID: DispatchWorkItem] = [:]
 
-    private var monitor = NWPathMonitor()
+    private let monitor = NWPathMonitor()
+    private var observing = false
     private var lastPath: String?
     private var restartWork: DispatchWorkItem?
 
-    init(name: String? = nil) {
+    init(name: String? = nil, identity: UUID? = nil) {
         self.name = name
+        injectedID = identity
+    }
+
+    /// Started by the first `start(key:)`, so an instance that never starts ignores wake and path events.
+    private func observe() {
+        guard !observing else { return }
+        observing = true
         // After sleep, Bonjour registration, browse results and sockets are stale; rebuild once the network settles.
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.scheduleRestart("wake")
@@ -66,6 +118,7 @@ final class Peers {
     func start(key: String?) {
         stop()
         guard let key, !key.isEmpty else { return }
+        observe()
         self.key = key
         ownName = name
         do {
@@ -105,10 +158,11 @@ final class Peers {
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.tick() }
     }
 
-    /// Ready outgoing connection ID for `name`, nil if absent or not ready. The ID is that connection's lifetime.
-    func connection(to name: String) -> UUID? {
-        guard let id = outgoing[name], conns[id]?.state == .ready else { return nil }
-        return id
+    /// Ready outgoing connection ID whose verified identity is `identity`, nil if absent or not ready. The ID is that
+    /// connection's lifetime.
+    func connection(to identity: String) -> UUID? {
+        guard let u = UUID(uuidString: identity) else { return nil }
+        return outgoing.values.first { ids[$0] == u && conns[$0]?.state == .ready }
     }
 
     /// Queues one frame on ready outgoing connections whose exact ID is in `recipients` and returns those IDs,
@@ -119,7 +173,7 @@ final class Peers {
         frame.append(message)
         var sent: Set<UUID> = []
         for id in outgoing.values where recipients.contains(id) {
-            guard let c = conns[id], c.state == .ready else { continue }
+            guard let c = conns[id], c.state == .ready, ids[id] != nil else { continue }
             c.send(content: frame, completion: .contentProcessed { [weak self, weak c] err in
                 guard let self, let c, self.conns[id] === c, err != nil else { return }
                 self.drop(id)
@@ -172,10 +226,11 @@ final class Peers {
             conns[id] = c
             outgoing[n] = id
             states[n] = states[n] ?? "connecting"
+            handshakes[id] = expire(id, after: handshakeTimeout, "no valid hello")
             c.stateUpdateHandler = { [weak self, weak c] s in
                 guard let self, let c, self.conns[id] === c else { return }
                 switch s {
-                case .ready: self.setState(n, "connected")
+                case .ready: self.sendHello(c, id)
                 case .failed(let e), .waiting(let e):
                     if case .tls = e { self.setState(n, "pairing key doesn't match", e) }
                     else { self.setState(n, "disconnected", e) }
@@ -190,11 +245,15 @@ final class Peers {
     }
 
     private func accept(_ c: NWConnection) {
+        guard incoming.count < maxIncoming else { log("peers: too many incoming connections"); c.cancel(); return }
         let id = UUID()
         conns[id] = c
+        incoming.insert(id)
+        handshakes[id] = expire(id, after: handshakeTimeout, "no valid hello")
         c.stateUpdateHandler = { [weak self, weak c] s in
             guard let self, let c, self.conns[id] === c else { return }
             switch s {
+            case .ready: self.sendHello(c, id)
             case .failed(let e): log("peers: incoming failed: \(e)"); self.drop(id)
             case .waiting(let e): log("peers: incoming waiting: \(e)"); self.drop(id)
             case .cancelled: self.drop(id)
@@ -205,6 +264,24 @@ final class Peers {
         receive(c, id)
     }
 
+    private func sendHello(_ c: NWConnection, _ id: UUID) {
+        c.send(content: Peers.helloFrame(ownID), completion: .contentProcessed { [weak self, weak c] err in
+            guard let self, let c, self.conns[id] === c, err != nil else { return }
+            self.drop(id)
+        })
+    }
+
+    /// Drops `id` after `secs` unless the returned item is cancelled first (by `drop`, or on success).
+    private func expire(_ id: UUID, after secs: Double, _ why: String) -> DispatchWorkItem {
+        let w = DispatchWorkItem { [weak self] in
+            guard let self, self.conns[id] != nil else { return }
+            log("peers: dropping connection: \(why)")
+            self.drop(id)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + secs, execute: w)
+        return w
+    }
+
     /// Removes and cancels the connection, then reports it. The table removal is the once-only gate, so every
     /// path (EOF, error, cancel, stop, vanished peer) can call this; stale callbacks of replaced connections no-op.
     private func drop(_ id: UUID) {
@@ -213,26 +290,55 @@ final class Peers {
             outgoing[n] = nil
             if states[n] == "connected" { setState(n, "disconnected") }
         }
+        ids[id] = nil; incoming.remove(id); buffers[id] = nil
+        handshakes.removeValue(forKey: id)?.cancel()
+        frameDeadlines.removeValue(forKey: id)?.cancel()
         c.cancel()
         onDisconnect(id)
     }
 
-    /// Reads 4-byte big-endian length, then payload, until EOF or error; any of those drops the connection.
+    /// Accumulates bytes and parses whole frames; any protocol violation, error or EOF drops the connection.
     private func receive(_ c: NWConnection, _ id: UUID) {
-        c.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self, weak c] d, _, done, err in
-            guard let self, let c, self.conns[id] === c else { return }
-            guard err == nil, let d, d.count == 4 else { self.drop(id); return }
-            let len = d.reduce(0) { $0 << 8 | Int($1) }
-            guard len <= Peers.maxFrame else { log("peers: oversized frame, dropping connection"); self.drop(id); return }
-            guard len > 0 else { if done { self.drop(id) } else { self.receive(c, id) }; return }
-            guard !done else { self.drop(id); return }  // EOF after a header: the body can never arrive
-            c.receive(minimumIncompleteLength: len, maximumLength: len) { [weak self, weak c] body, _, done, err in
-                guard let self, let c, self.conns[id] === c else { return }
-                guard err == nil, let body, body.count == len else { self.drop(id); return }
-                self.onMessage(body, id)
-                if done { self.drop(id) } else if self.conns[id] === c { self.receive(c, id) }
+        c.receive(minimumIncompleteLength: 1, maximumLength: Peers.maxFrame) { [weak self] d, _, done, err in
+            guard let self, self.conns[id] === c else { return }
+            if let d { self.buffers[id, default: Data()].append(d) }
+            guard self.consume(id) else { self.drop(id); return }
+            guard self.conns[id] === c else { return }
+            if err != nil || done { self.drop(id) } else { self.receive(c, id) }
+        }
+    }
+
+    /// Handles every complete frame in the buffer; false on a protocol violation. The first frame must be a valid
+    /// hello from another identity. A partial frame left over arms a fixed deadline for the rest of it.
+    private func consume(_ id: UUID) -> Bool {
+        var consumed = false
+        guard let buf = buffers[id] else { return true }
+        var off = 0  // parsed prefix; trimmed once so coalesced frames aren't recopied
+        while buf.count - off >= 4 {
+            let len = buf.dropFirst(off).prefix(4).reduce(0) { $0 << 8 | Int($1) }
+            guard len <= Peers.maxFrame, ids[id] != nil || len == Peers.helloLength else {
+                log("peers: bad frame length, dropping connection"); return false
+            }
+            guard buf.count - off >= 4 + len else { break }
+            let payload = Data(buf.dropFirst(off + 4).prefix(len))
+            off += 4 + len
+            consumed = true
+            if ids[id] == nil {
+                guard let peer = Peers.parseHello(payload), peer != ownID else { log("peers: invalid hello, dropping connection"); return false }
+                ids[id] = peer
+                handshakes.removeValue(forKey: id)?.cancel()
+                for (n, o) in outgoing where o == id { setState(n, "connected") }
+            } else if len > 0 {
+                onMessage(payload, id)
+                if conns[id] == nil { return true }
             }
         }
+        if off > 0 { buffers[id] = Data(buf.dropFirst(off)) }
+        if consumed { frameDeadlines.removeValue(forKey: id)?.cancel() }
+        if buffers[id]?.isEmpty == false, frameDeadlines[id] == nil {
+            frameDeadlines[id] = expire(id, after: frameTimeout, "incomplete frame")
+        }
+        return true
     }
 
     private func parameters(_ key: String) -> NWParameters {

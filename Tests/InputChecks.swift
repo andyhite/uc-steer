@@ -69,6 +69,100 @@ struct InputChecks {
         let keyboard = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true)!
         replay(buttonMessage(keyboard, device: DeviceID(vendor: 1, product: 2))!, from: a)
         assert(replayedButtons.isEmpty)
+
+        // Valid replayed down: handled and posted states, duplicates ignored, release posts only for posted clicks.
+        var posted: [CGEventType] = [], acted = 0
+        var fx = ButtonEffects()
+        fx.post = { posted.append($0.type) }
+        fx.act = { _ in acted += 1; return true }
+        fx.reload = {}
+        let id12 = DeviceID(vendor: 1, product: 2)
+        let device = Device(name: "M", id: id12, profileID: "x-coredata://a", label: "M", actions: [4: ["Selector": "X"]],
+                            flipVertical: false, flipHorizontal: false)
+        let downMessage = buttonMessage(event(.otherMouseDown, sender: 700), device: id12)!
+        fx.lookup = { $0 == id12 ? device : nil }
+        replay(downMessage, from: a, fx)
+        replay(downMessage, from: a, fx)
+        assert(acted == 1 && posted.isEmpty)
+        if case .handled? = replayedButtons[aButton] {} else { assertionFailure("handled state") }
+        replay(up, from: a, fx)
+        assert(posted.isEmpty && replayedButtons.isEmpty)
+        fx.lookup = { _ in nil }
+        replay(downMessage, from: a, fx)
+        replay(downMessage, from: a, fx)
+        assert(posted == [.otherMouseDown])
+        if case .posted? = replayedButtons[aButton] {} else { assertionFailure("posted state") }
+        replay(up, from: a, fx)
+        assert(posted == [.otherMouseDown, .otherMouseUp] && replayedButtons.isEmpty)
+
+        // Forward: new route, then a stale press is released to its original recipients even from a new SteerMouse PID.
+        let route1 = UUID(), route2 = UUID()
+        var route = route1
+        var sent: [(CGEventType, Set<UUID>)] = []
+        var f = ButtonEffects()
+        var destinationOn = true
+        f.destination = { destinationOn ? "peer-id" : nil }
+        f.connection = { $0 == "peer-id" ? route : nil }
+        f.send = { data, to in
+            sent.append((CGEvent(withDataAllocator: nil, data: Data(data.dropFirst(buttonMessageHeaderSize)) as CFData)!.type, to))
+            return to
+        }
+        f.pointerHere = { false }
+        f.steerMouse = { $0 > 0 }
+        f.device = { _ in id12 }
+        assert(forward(.otherMouseDown, event(.otherMouseDown, sender: 700, pid: 10), f))
+        assert(forwardedButtons[remote]?.recipients == [route1] && sent.count == 1)
+        route = route2
+        assert(forward(.otherMouseDown, event(.otherMouseDown, sender: 700, pid: 11), f))
+        assert(sent.map(\.0) == [.otherMouseDown, .otherMouseUp, .otherMouseDown])
+        assert(sent[1].1 == [route1] && sent[2].1 == [route2])
+        assert(forwardedButtons[remote]?.pid == 11 && forwardedButtons[remote]?.recipients == [route2])
+        assert(!forward(.otherMouseUp, event(.otherMouseUp, sender: 700, pid: 10), f)) // mismatched release stays local
+        assert(forwardedButtons[remote] != nil)
+        assert(forward(.otherMouseUp, event(.otherMouseUp, sender: 700, pid: 11), f))
+        assert(forwardedButtons.isEmpty && sent.count == 4)
+
+        // Same PID, destination now off: the stale press is still released and the new down stays local.
+        assert(forward(.otherMouseDown, event(.otherMouseDown, sender: 700, pid: 12), f))
+        destinationOn = false
+        assert(!forward(.otherMouseDown, event(.otherMouseDown, sender: 700, pid: 12), f))
+        assert(sent.count == 6 && sent[5].0 == .otherMouseUp && forwardedButtons.isEmpty)
+
+        // Same-named profiles get distinct labels, and overrides use the exact profile ID.
+        func make(_ name: String, _ id: String) -> Device {
+            Device(name: name, id: id12, profileID: id, label: name, actions: [:], flipVertical: true, flipHorizontal: false)
+        }
+        let twins = labeled([make("M", "x-coredata://2"), make("M", "x-coredata://1"), make("N", "x-coredata://3")])
+        assert(Set(twins.map(\.label)).count == 3 && twins.last?.label == "N")
+        assert(profile(for: id12, overrides: ["0001:0002": "x-coredata://2"], in: twins)?.profileID == "x-coredata://2")
+        assert(migratedOverrides(["a": "N", "b": "M", "c": "x-coredata://9", "d": "gone"], twins)
+               == ["a": "x-coredata://3", "c": "x-coredata://9"])
+
+        // A failed load retries without an mtime change, but not within the retry interval; success caches the mtime.
+        var mtime = Date(timeIntervalSince1970: 5)
+        var clock: UInt64 = 1_000_000_000_000, loads = 0, fail = true
+        devices = []; settingsDate = .distantPast; settingsRetryAt = 0
+        func reload() {
+            reloadSettingsIfChanged(modified: { mtime }, load: {
+                loads += 1
+                if fail { throw Failure(description: "busy") }
+                return [twins[0]]
+            }, migrate: { _ in }, now: { clock })
+        }
+        reload(); reload()
+        assert(loads == 1 && settingsDate == .distantPast)
+        clock += 10_000_000_000; reload()
+        assert(loads == 2)
+        fail = false; clock += 10_000_000_000; reload()
+        assert(loads == 3 && settingsDate == mtime && devices.count == 1)
+        reload()
+        assert(loads == 3)
+        // A failure after an mtime change still retries once the file returns to the last good mtime.
+        let good = mtime
+        mtime = Date(timeIntervalSince1970: 6); fail = true; reload()
+        assert(loads == 4 && devices.isEmpty)
+        mtime = good; fail = false; clock += 10_000_000_000; reload()
+        assert(loads == 5 && devices.count == 1)
         print("Input ownership checks passed")
     }
 }

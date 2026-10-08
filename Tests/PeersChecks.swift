@@ -22,6 +22,8 @@ final class PeersServer {
     var conns: [NWConnection] = []
     var received: [Data] = []  // bytes read from each accepted connection, same index as `conns`
     var script: (NWConnection) -> Void = { _ in }
+    var id = UUID()      // identity announced in the hello
+    var hello = true     // send a valid hello before `script` runs
     var port: NWEndpoint.Port { listener.port! }
 
     init(_ params: NWParameters) {
@@ -33,6 +35,7 @@ final class PeersServer {
             let i = conns.count - 1
             c.start(queue: .main)
             drain(c, i)
+            if hello { c.send(content: Peers.helloFrame(id), completion: .idempotent) }
             script(c)
         }
         listener.start(queue: .main)
@@ -84,10 +87,13 @@ extension Peers {
     }
 
     /// Plays `chunks` from a scripted peer to a Peers outgoing connection and returns what Peers reported.
-    static func scenario(_ what: String, chunks: [Data], close: Bool = true, settle: Double = 0.4) -> (Peers, PeersRecorder, PeersServer) {
-        let p = Peers()
+    static func scenario(_ what: String, chunks: [Data], close: Bool = true, settle: Double = 0.4, hello: Bool = true,
+                         me: UUID = UUID(), peer: UUID = UUID(), configure: (Peers) -> Void = { _ in }) -> (Peers, PeersRecorder, PeersServer) {
+        let p = Peers(identity: me)
+        configure(p)
         let r = PeersRecorder(p)
         let s = PeersServer(p.parameters(testKey))
+        s.hello = hello; s.id = peer
         s.script = { c in PeersServer.play(c, chunks, close: close) }
         p.connect(to: s)
         peersCheck(peersWait { !r.disconnects.isEmpty }, "\(what): connection was dropped")
@@ -131,7 +137,7 @@ extension Peers {
         }
         do { // fragmented stream: byte-at-a-time header+body, a zero-length frame, then a second frame
             let bytes = peersFrame(body) + Data([0, 0, 0, 0]) + peersFrame(Data("ab".utf8))
-            let p = Peers(), r = PeersRecorder(p)
+            let p = Peers(identity: UUID()), r = PeersRecorder(p)
             let s = PeersServer(p.parameters(testKey))
             s.script = { c in PeersServer.play(c, bytes.map { Data([$0]) }, close: false) }
             p.connect(to: s)
@@ -145,7 +151,7 @@ extension Peers {
             s.stop()
         }
         do { // incoming (accepted) connections use the same receive/teardown path
-            let p = Peers(), r = PeersRecorder(p)
+            let p = Peers(identity: UUID()), r = PeersRecorder(p)
             p.key = testKey
             let lp = p.parameters(testKey)
             lp.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
@@ -155,7 +161,7 @@ extension Peers {
             peersCheck(peersWait { l.state == .ready && l.port != nil }, "accept: listener ready")
             let c = NWConnection(to: .hostPort(host: .ipv4(.loopback), port: l.port!), using: p.parameters(testKey))
             c.start(queue: .main)
-            PeersServer.play(c, [peersFrame(body)], close: false)
+            PeersServer.play(c, [Peers.helloFrame(UUID()), peersFrame(body)], close: false)
             peersCheck(peersWait { r.messages.count == 1 }, "accept: message delivered")
             peersCheck(r.messages[0].0 == body && p.conns[r.messages[0].1] != nil, "accept: ID owns a live connection")
             peersCheck(p.send(body, to: [r.messages[0].1]).isEmpty, "accept: incoming connections are never send targets")
@@ -166,76 +172,187 @@ extension Peers {
             l.cancel()
         }
         do { // recipient scoping across reconnect, then stop invalidation
-            let p = Peers(), r = PeersRecorder(p)
+            let me = UUID(), hf = Peers.helloFrame(me)
+            let p = Peers(identity: me), r = PeersRecorder(p)
             let s = PeersServer(p.parameters(testKey))
+            let sid = s.id.uuidString
             p.connect(to: s)
-            peersCheck(peersWait { p.conns.values.allSatisfy { $0.state == .ready } && s.conns.count == 1 }, "reconnect: first connected")
+            peersCheck(peersWait { p.connection(to: sid) != nil && s.conns.count == 1 }, "reconnect: first connected")
             let a = p.outgoing["srv"]!
-            peersCheck(p.connection(to: "srv") == a && p.send(body, to: [a]) == [a], "reconnect: explicit send reaches A")
-            peersCheck(peersWait { s.received[0] == peersFrame(body) }, "reconnect: A's peer got exactly one frame")
+            peersCheck(p.connection(to: sid) == a && p.send(body, to: [a]) == [a], "reconnect: explicit send reaches A")
+            peersCheck(peersWait { s.received[0] == hf + peersFrame(body) }, "reconnect: A's peer got hello + one frame")
 
             s.conns[0].cancel()
             peersCheck(peersWait { r.disconnects == [a] }, "reconnect: A dropped")
-            peersCheck(p.send(body, to: [a]).isEmpty && p.connection(to: "srv") == nil, "reconnect: nothing to send to while down")
+            peersCheck(p.send(body, to: [a]).isEmpty && p.connection(to: sid) == nil, "reconnect: nothing to send to while down")
             p.refresh()
-            peersCheck(peersWait { s.conns.count == 2 && p.conns.values.allSatisfy { $0.state == .ready } }, "reconnect: second connected")
+            peersCheck(peersWait { s.conns.count == 2 && p.connection(to: sid) != nil }, "reconnect: second connected")
             let b = p.outgoing["srv"]!
             peersCheck(a != b, "reconnect: new connection has a new ID")
             peersCheck(p.send(body, to: [a]).isEmpty, "reconnect: stale recipient A is not served by B")
             peersCheck(p.send(body, to: []).isEmpty, "reconnect: empty recipient set sends nothing")
             peersSpin(0.3)
-            peersCheck(s.received[1].isEmpty, "reconnect: B's peer got nothing for A")
-            peersCheck(p.connection(to: "srv") == b, "reconnect: name resolves to B")
+            peersCheck(s.received[1] == hf, "reconnect: B's peer got nothing for A")
+            peersCheck(p.connection(to: sid) == b, "reconnect: identity resolves to B")
             peersCheck(p.send(body, to: [a, b]) == [b] && p.send(body, to: [b]) == [b], "reconnect: B receives when named")
-            peersCheck(peersWait { s.received[1] == peersFrame(body) + peersFrame(body) }, "reconnect: B's peer got exactly two frames")
+            peersCheck(peersWait { s.received[1] == hf + peersFrame(body) + peersFrame(body) }, "reconnect: B's peer got exactly two frames")
             peersCheck(p.send(Data(count: 65537), to: [b]).isEmpty, "oversized send refused")
 
             let before = r.disconnects.count
             p.stop()  // synchronous: one disconnect for B, tables empty
             peersCheck(r.disconnects.count == before + 1 && r.disconnects.last == b, "stop: B reported synchronously, once")
-            peersCheck(p.conns.isEmpty && p.outgoing.isEmpty && p.found.isEmpty && p.key == nil, "stop: state cleared")
-            peersCheck(p.send(body, to: [b]).isEmpty && p.connection(to: "srv") == nil, "stop: B invalidated")
+            peersCheck(p.conns.isEmpty && p.outgoing.isEmpty && p.found.isEmpty && p.key == nil && p.ids.isEmpty, "stop: state cleared")
+            peersCheck(p.send(body, to: [b]).isEmpty && p.connection(to: sid) == nil, "stop: B invalidated")
             p.refresh()
             peersCheck(p.conns.isEmpty, "stop: refresh without a key connects nothing")
             peersSpin(0.3)
             peersCheck(r.disconnects.count == before + 1, "stop: no duplicate disconnect")
 
             p.connect(to: s)  // same peer after restart gets a fresh ID that old recipients can't reach
-            peersCheck(peersWait { s.conns.count == 3 && p.conns.values.allSatisfy { $0.state == .ready } }, "restart: connected")
+            peersCheck(peersWait { s.conns.count == 3 && p.connection(to: sid) != nil }, "restart: connected")
             let c = p.outgoing["srv"]!
             peersCheck(c != a && c != b, "restart: fresh ID")
             peersCheck(p.send(body, to: [a, b]).isEmpty && p.send(body, to: [c]) == [c], "restart: only C is served")
             p.stop(); s.stop()
         }
-        do { // explicit routing: two ready destinations, only the named ID receives; reconnect never retargets
-            let p = Peers(), r = PeersRecorder(p)
+        do { // explicit routing by identity; reconnect never retargets
+            let p = Peers(identity: UUID()), r = PeersRecorder(p)
             let s1 = PeersServer(p.parameters(testKey)), s2 = PeersServer(p.parameters(testKey))
-            peersCheck(p.connection(to: "one") == nil, "route: unknown name has no connection")
+            let hf = Peers.helloFrame(p.ownID)
+            peersCheck(p.connection(to: s1.id.uuidString) == nil && p.connection(to: "not a uuid") == nil, "route: unknown identity has no connection")
             p.connect(to: s1, as: "one")
             p.connect(to: s2, as: "two")
-            peersCheck(peersWait { s1.conns.count == 1 && s2.conns.count == 1 && p.conns.values.allSatisfy { $0.state == .ready } }, "route: both connected")
-            let one = p.connection(to: "one"), two = p.connection(to: "two")
-            peersCheck(one != nil && two != nil && one != two, "route: ready names have distinct IDs")
-            peersCheck(p.connection(to: "missing") == nil, "route: missing name has no connection")
-            peersCheck(p.send(body, to: [two!]) == [two!], "route: explicit ID is served")
-            peersCheck(peersWait { s2.received[0] == peersFrame(body) }, "route: chosen peer got the frame")
+            peersCheck(peersWait { p.connection(to: s1.id.uuidString) != nil && p.connection(to: s2.id.uuidString) != nil }, "route: both connected")
+            let one = p.connection(to: s1.id.uuidString)!, two = p.connection(to: s2.id.uuidString)!
+            peersCheck(one != two, "route: ready identities have distinct IDs")
+            peersCheck(p.status.map { $0.id } == [s1.id.uuidString, s2.id.uuidString], "route: status carries identities")
+            peersCheck(p.connection(to: UUID().uuidString) == nil, "route: missing identity has no connection")
+            peersCheck(p.send(body, to: [two]) == [two], "route: explicit ID is served")
+            peersCheck(peersWait { s2.received[0] == hf + peersFrame(body) }, "route: chosen peer got the frame")
             peersSpin(0.3)
-            peersCheck(s1.received[0].isEmpty, "route: unchosen peer got nothing")
+            peersCheck(s1.received[0] == hf, "route: unchosen peer got nothing")
             peersCheck(p.send(body, to: []).isEmpty, "route: empty set sends nothing")
             s2.conns[0].cancel()
-            peersCheck(peersWait { r.disconnects == [two!] }, "route: chosen connection dropped")
-            peersCheck(p.connection(to: "two") == nil, "route: dropped name has no connection")
+            peersCheck(peersWait { r.disconnects == [two] }, "route: chosen connection dropped")
+            peersCheck(p.connection(to: s2.id.uuidString) == nil, "route: dropped identity has no connection")
             p.refresh()
-            peersCheck(peersWait { s2.conns.count == 2 && p.connection(to: "two") != nil }, "route: reconnected")
-            let two2 = p.connection(to: "two")!
-            peersCheck(two2 != two!, "route: replacement has a new ID")
-            peersCheck(p.send(body, to: [two!]).isEmpty, "route: old ID never retargets replacement")
+            peersCheck(peersWait { s2.conns.count == 2 && p.connection(to: s2.id.uuidString) != nil }, "route: reconnected")
+            let two2 = p.connection(to: s2.id.uuidString)!
+            peersCheck(two2 != two, "route: replacement has a new ID")
+            peersCheck(p.send(body, to: [two]).isEmpty, "route: old ID never retargets replacement")
             peersSpin(0.3)
-            peersCheck(s2.received[1].isEmpty && s1.received[0].isEmpty, "route: nobody received old-ID send")
+            peersCheck(s2.received[1] == hf && s1.received[0] == hf, "route: nobody received old-ID send")
             peersCheck(p.send(body, to: [two2]) == [two2], "route: new ID reaches replacement")
-            peersCheck(peersWait { s2.received[1] == peersFrame(body) }, "route: replacement got the frame")
-            peersCheck(s1.received[0].isEmpty, "route: first peer still untouched")
+            peersCheck(peersWait { s2.received[1] == hf + peersFrame(body) }, "route: replacement got the frame")
+            peersCheck(s1.received[0] == hf, "route: first peer still untouched")
             p.stop(); s1.stop(); s2.stop()
+        }
+        do { // same name, new identity: the old selection is not silently switched
+            let p = Peers(identity: UUID())
+            let s1 = PeersServer(p.parameters(testKey)), s2 = PeersServer(p.parameters(testKey))
+            p.connect(to: s1)
+            peersCheck(peersWait { p.connection(to: s1.id.uuidString) != nil }, "name reuse: first connected")
+            s1.stop()
+            peersCheck(peersWait { p.outgoing.isEmpty }, "name reuse: first dropped")
+            p.connect(to: s2)
+            peersCheck(peersWait { p.connection(to: s2.id.uuidString) != nil }, "name reuse: second connected")
+            peersCheck(p.connection(to: s1.id.uuidString) == nil, "name reuse: old identity not routed to new peer")
+            peersCheck(p.status.map { $0.id } == [s2.id.uuidString] && p.status.map { $0.name } == ["srv"], "name reuse: status shows new identity")
+            p.stop(); s2.stop()
+        }
+        do { // same identity under a new name: reconnects, same identity routes
+            let p = Peers(identity: UUID())
+            let s = PeersServer(p.parameters(testKey))
+            p.connect(to: s, as: "old")
+            peersCheck(peersWait { p.connection(to: s.id.uuidString) != nil }, "rename: connected as old")
+            p.found = [:]
+            p.connect(to: s, as: "new")
+            peersCheck(peersWait { p.status.map { $0.name } == ["new"] && p.connection(to: s.id.uuidString) != nil }, "rename: reconnected as new")
+            peersCheck(p.status.map { $0.id } == [s.id.uuidString], "rename: same identity")
+            p.stop(); s.stop()
+        }
+        do { // hello must be first, well-formed, current, and not our own identity
+            func hello(_ version: UInt8, magic: String = "UCSH", _ id: UUID = UUID()) -> Data {
+                peersFrame(Data(magic.utf8) + Data([version]) + withUnsafeBytes(of: id.uuid) { Data($0) })
+            }
+            let me = UUID()
+            let bad: [(String, Data)] = [
+                ("old version", hello(0)),
+                ("future version", hello(2)),
+                ("bad magic", hello(1, magic: "XXXX")),
+                ("short hello", peersFrame(Data("UCSH".utf8) + Data([1, 2, 3]))),
+                ("application frame first", peersFrame(body)),
+                ("empty frame first", Data([0, 0, 0, 0])),
+                ("own identity", hello(1, me)),
+            ]
+            for (what, first) in bad {
+                let (_, r, s) = scenario("hello: \(what)", chunks: [first, peersFrame(body)], close: false, hello: false, me: me)
+                peersCheck(r.messages.isEmpty, "hello: \(what): nothing delivered"); s.stop()
+            }
+            let (_, r, s) = scenario("self hello", chunks: [peersFrame(body)], close: false, me: me, peer: me)
+            peersCheck(r.messages.isEmpty, "self hello: nothing delivered"); s.stop()
+        }
+        do { // handshake deadline runs from connect, before any header byte
+            let t = Date()
+            let (_, r, s) = scenario("handshake expiry", chunks: [], close: false, hello: false) { $0.handshakeTimeout = 0.4 }
+            peersCheck(Date().timeIntervalSince(t) >= 0.35 && r.messages.isEmpty, "handshake expiry: not before deadline"); s.stop()
+        }
+        do { // partial header, partial body, and trickle all expire from the first byte
+            let (_, r1, s1) = scenario("partial header", chunks: [Data([0, 0])], close: false) { $0.frameTimeout = 0.4 }
+            peersCheck(r1.messages.isEmpty, "partial header: nothing delivered"); s1.stop()
+            let (_, r2, s2) = scenario("partial body", chunks: [peersFrame(body).prefix(6).map { $0 }].map { Data($0) }, close: false) { $0.frameTimeout = 0.4 }
+            peersCheck(r2.messages.isEmpty, "partial body: nothing delivered"); s2.stop()
+            let slow = peersFrame(Data(repeating: 1, count: 100)).map { Data([$0]) }  // ~1s of trickle
+            let (_, r3, s3) = scenario("trickle", chunks: slow, close: false) { $0.frameTimeout = 0.4 }
+            peersCheck(r3.messages.isEmpty, "trickle: deadline not extended by arriving bytes"); s3.stop()
+        }
+        do { // authenticated idle sockets live on, with no deadline armed
+            let p = Peers(identity: UUID()), r = PeersRecorder(p)
+            p.handshakeTimeout = 0.3; p.frameTimeout = 0.3
+            let s = PeersServer(p.parameters(testKey))
+            p.connect(to: s)
+            peersCheck(peersWait { p.connection(to: s.id.uuidString) != nil }, "idle: connected")
+            PeersServer.play(s.conns[0], [peersFrame(body)], close: false)
+            peersCheck(peersWait { r.messages.count == 1 }, "idle: frame delivered")
+            peersSpin(1.0)
+            peersCheck(r.disconnects.isEmpty && p.connection(to: s.id.uuidString) != nil, "idle: still connected")
+            peersCheck(p.handshakes.isEmpty && p.frameDeadlines.isEmpty, "idle: no deadlines pending")
+            p.stop(); s.stop()
+            peersCheck(p.handshakes.isEmpty && p.frameDeadlines.isEmpty && p.buffers.isEmpty, "idle: stop cleans deadlines")
+        }
+        do { // incoming cap applies before retention and releases on close
+            let p = Peers(identity: UUID())
+            p.key = testKey; p.maxIncoming = 2; p.handshakeTimeout = 60
+            let lp = p.parameters(testKey)
+            lp.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
+            let l = try! NWListener(using: lp)
+            l.newConnectionHandler = { p.accept($0) }
+            l.start(queue: .main)
+            peersCheck(peersWait { l.state == .ready && l.port != nil }, "cap: listener ready")
+            func dial() -> NWConnection {
+                let c = NWConnection(to: .hostPort(host: .ipv4(.loopback), port: l.port!), using: p.parameters(testKey))
+                c.start(queue: .main); return c
+            }
+            let c1 = dial(), c2 = dial()
+            peersCheck(peersWait { p.conns.count == 2 }, "cap: two accepted")
+            let c3 = dial()
+            peersSpin(0.6)
+            peersCheck(p.conns.count == 2 && p.incoming.count == 2, "cap: third not retained")
+            c3.cancel()
+            c1.cancel()
+            peersCheck(peersWait { p.conns.count == 1 }, "cap: closing releases a slot")
+            let c4 = dial()
+            peersCheck(peersWait { p.conns.count == 2 }, "cap: slot reused")
+            c2.cancel(); c4.cancel(); p.stop(); l.cancel()
+        }
+        do { // wrong key: TLS never completes, no hello, nothing routable
+            let p = Peers(identity: UUID()), r = PeersRecorder(p)
+            let s = PeersServer(p.parameters("wrong-key"))
+            p.connect(to: s)
+            peersSpin(1.0)
+            peersCheck(p.connection(to: s.id.uuidString) == nil && p.status.allSatisfy { $0.id == nil }, "wrong key: not routable")
+            peersCheck(r.messages.isEmpty && s.received.allSatisfy { $0.isEmpty }, "wrong key: no frames either way")
+            p.stop(); s.stop()
         }
         print("Peers transport checks passed")
     }

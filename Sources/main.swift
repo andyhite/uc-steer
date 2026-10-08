@@ -6,9 +6,36 @@ import notify
 
 // MARK: Pairing key
 
-var pairingKey = PairingKey.read()
+var pairingKey: String?
+var pairingKeyError: Error?
+
+@discardableResult func reloadPairingKey() -> Bool {
+    do {
+        let key = try PairingKey.read()
+        pairingKeyError = nil
+        if key != pairingKey {
+            pairingKey = key
+            peers.start(key: key)
+        }
+        return true
+    } catch {
+        pairingKeyError = error
+        log("can't read the pairing key: \(error.localizedDescription)")
+        return false
+    }
+}
 
 func editPairingKey() {
+    // Never offer a replacement for a key we could not read, including after a rebuild or unlock.
+    while !reloadPairingKey() {
+        let failure = NSAlert()
+        failure.messageText = "Couldn't read the pairing key"
+        failure.informativeText = "\(pairingKeyError!.localizedDescription)\nUnlock the login keychain or allow access, then retry. Your saved key has not been changed."
+        failure.addButton(withTitle: "Retry")
+        failure.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard failure.runModal() == .alertFirstButtonReturn else { return }
+    }
     let alert = NSAlert()
     alert.messageText = "Pairing Key"
     alert.informativeText = """
@@ -98,30 +125,37 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         for mouse in mice { menu.addItem(settingsItem(mouse.name, mouse.id)) }
 
         menu.addItem(.separator())
-        if pairingKey == nil {
+        if pairingKeyError != nil {
+            menu.addItem(menuItem("Pairing key unavailable — retry Pairing Key…"))
+        }
+        if pairingKey == nil && pairingKeyError == nil {
             menu.addItem(menuItem("Gesture button forwarding is off"))
-        } else {
+        } else if pairingKey != nil {
             let peerStatus = peers.status
             if peerStatus.isEmpty { menu.addItem(menuItem("No other Macs with uc-steer found")) }
             for peer in peerStatus { menu.addItem(menuItem("\(peer.name): \(peer.state)")) }
             let selected = forwardingDestination
-            let live = selected.flatMap { name in peerStatus.first { $0.name == name } }
-            let note = selected.map { live == nil ? "\($0) (unavailable)" : $0 } ?? "Off"
+            let live = selected.flatMap { id in peerStatus.first { $0.id == id } }
+            let note = live?.name ?? (selected == nil ? "Off" : "Selected Mac (unavailable)")
             let root = NSMenuItem(title: "Forward Gestures To: \(note)", action: nil, keyEquivalent: "")
             let sub = NSMenu()
             sub.addItem(menuItem("Off", checked: selected == nil) { forwardingDestination = nil })
             for peer in peerStatus {
-                sub.addItem(menuItem("\(peer.name): \(peer.state)", checked: selected == peer.name) {
-                    forwardingDestination = peer.name
-                })
+                if let id = peer.id {
+                    sub.addItem(menuItem("\(peer.name): \(peer.state)", checked: selected == id) {
+                        forwardingDestination = id
+                    })
+                } else {
+                    sub.addItem(menuItem("\(peer.name): \(peer.state)"))
+                }
             }
-            if let selected, live == nil {
-                sub.addItem(menuItem("\(selected) (unavailable)", checked: true))
+            if selected != nil, live == nil {
+                sub.addItem(menuItem("Selected Mac (unavailable)", checked: true))
             }
             root.submenu = sub
             menu.addItem(root)
         }
-        menu.addItem(menuItem("Pairing Key…", action: editPairingKey))
+        menu.addItem(menuItem(pairingKeyError == nil ? "Pairing Key…" : "Retry Pairing Key…", action: editPairingKey))
 
         menu.addItem(.separator())
         if tap == nil {
@@ -136,13 +170,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     // "<mouse>: <SteerMouse device>", with a submenu to choose which SteerMouse device's settings it uses.
     func settingsItem(_ name: String, _ id: DeviceID) -> NSMenuItem {
         let chosen = settingsOverrides[id.key]
-        let item = menuItem("\(name): \(settings(for: id)?.name ?? "none")")
+        let item = menuItem("\(name): \(settings(for: id)?.label ?? "none")")
         let submenu = NSMenu()
-        let automatic = devices.first { $0.id == id }?.name ?? "none"
+        let automatic = devices.first { $0.id == id }?.label ?? "none"
         submenu.addItem(menuItem("Automatic (\(automatic))", checked: chosen == nil) { settingsOverrides[id.key] = nil })
         submenu.addItem(.separator())
         for device in devices {
-            submenu.addItem(menuItem(device.name, checked: chosen == device.name) { settingsOverrides[id.key] = device.name })
+            submenu.addItem(menuItem(device.label, checked: chosen == device.profileID) { settingsOverrides[id.key] = device.profileID })
         }
         item.submenu = submenu
         return item
@@ -166,9 +200,9 @@ app.mainMenu = NSMenu()
 app.mainMenu?.addItem(withTitle: "Edit", action: nil, keyEquivalent: "").submenu = editMenu
 let statusMenu = StatusMenu()
 
-peers.onMessage = replay
+peers.onMessage = { replay($0, from: $1) }
 peers.onDisconnect = disconnectPeer
-peers.start(key: pairingKey)
+reloadPairingKey()
 let terminationObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
                                                                  object: app, queue: .main) { _ in
     peers.start(key: nil) // Release replayed clicks before exiting; remote peers clean up on EOF.

@@ -44,6 +44,8 @@ struct DeviceID: Hashable {
 struct Device {
     let name: String
     let id: DeviceID
+    let profileID: String  // SteerMouse's Core Data object URI: the one exact identity of this profile
+    var label: String  // name, plus distinguishing details when profiles share a name
     let actions: [Int: [String: Any]]  // button bit (1 << CGEvent button number) -> SteerMouse action
     let flipVertical: Bool, flipHorizontal: Bool  // SteerMouse reverses this scroll axis
 }
@@ -97,11 +99,21 @@ func loadSettings() throws -> [Device] {
         let flipVertical = reversesAxis(wheelDirections, "Roll Up", "Up", "Roll Down", "Down", device: name)
         let flipHorizontal = reversesAxis(wheelDirections, "\(horizontal) Left", "Left", "\(horizontal) Right", "Right", device: name)
         if !actions.isEmpty || flipVertical || flipHorizontal {
-            devices.append(Device(name: name, id: DeviceID(vendor: vendor, product: product), actions: actions,
-                                  flipVertical: flipVertical, flipHorizontal: flipHorizontal))
+            devices.append(Device(name: name, id: DeviceID(vendor: vendor, product: product),
+                                  profileID: device.objectID.uriRepresentation().absoluteString, label: name,
+                                  actions: actions, flipVertical: flipVertical, flipHorizontal: flipHorizontal))
         }
     }
-    return devices.sorted { $0.name < $1.name }
+    return labeled(devices)
+}
+
+// Stable order, and labels that tell same-named profiles apart.
+func labeled(_ devices: [Device]) -> [Device] {
+    var sorted = devices.sorted { ($0.name, $0.profileID) < ($1.name, $1.profileID) }
+    for (name, group) in Dictionary(grouping: sorted.indices, by: { sorted[$0].name }) where group.count > 1 {
+        for (n, i) in group.enumerated() { sorted[i].label = "\(name) (\(sorted[i].id.key)) #\(n + 1)" }
+    }
+    return sorted
 }
 
 // True when SteerMouse reverses both directions of one wheel axis. Other remaps (one direction only, or onto
@@ -117,31 +129,55 @@ func reversesAxis(_ directions: [String: String], _ wheelA: String, _ a: String,
 }
 
 var devices: [Device] = []
-var settingsDate: Date? = .distantPast
+var settingsDate: Date? = .distantPast  // modification time of the last successful load
+var settingsRetryAt: UInt64 = 0  // monotonic nanoseconds; nonzero while a load failure awaits retry
 
-func reloadSettingsIfChanged() {
-    let date = (try? FileManager.default.attributesOfItem(atPath: store.path))?[.modificationDate] as? Date
-    guard date != settingsDate else { return }
-    settingsDate = date
+// A failed load retries at most once a second, even on an unchanged file, so the event tap never loops on I/O.
+func reloadSettingsIfChanged(modified: () -> Date? = { (try? FileManager.default.attributesOfItem(atPath: store.path))?[.modificationDate] as? Date },
+                             load: () throws -> [Device] = loadSettings,
+                             migrate: ([Device]) -> Void = { devices in
+                                 let migrated = migratedOverrides(settingsOverrides, devices)
+                                 if migrated != settingsOverrides { settingsOverrides = migrated }
+                             },
+                             now: () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }) {
+    let time = now()
+    guard time >= settingsRetryAt else { return }
+    let date = modified()
+    guard date != settingsDate || settingsRetryAt != 0 else { return }  // a pending failure retries even at the last good mtime
     do {
-        devices = try loadSettings()
-        log("loaded SteerMouse settings for: " + devices.map(\.name).joined(separator: ", "))
+        devices = try load()
+        settingsDate = date
+        settingsRetryAt = 0
+        migrate(devices)
+        log("loaded SteerMouse settings for: " + devices.map(\.label).joined(separator: ", "))
     } catch {
         devices = []
+        settingsRetryAt = time + 1_000_000_000
         log("can't read SteerMouse settings: \(error)")
     }
 }
 
-// The SteerMouse device whose settings each Universal Control mouse uses, keyed by DeviceID.key. Chosen in the
-// menu. Mice without an entry use the SteerMouse device with the same vendor and product ID.
+// The SteerMouse profile whose settings each Universal Control mouse uses, keyed by DeviceID.key. Chosen in the
+// menu. Values are Device.profileID; mice without an entry use the SteerMouse device with the same vendor and product ID.
 var settingsOverrides = UserDefaults.standard.dictionary(forKey: "settingsOverrides") as? [String: String] ?? [:] {
     didSet { UserDefaults.standard.set(settingsOverrides, forKey: "settingsOverrides") }
 }
 
-func settings(for id: DeviceID) -> Device? {
-    if let name = settingsOverrides[id.key], let device = devices.first(where: { $0.name == name }) { return device }
+// Old overrides stored a profile name: keep it as a profile ID only if exactly one profile has that name.
+func migratedOverrides(_ overrides: [String: String], _ devices: [Device]) -> [String: String] {
+    overrides.compactMapValues { value in
+        if value.hasPrefix("x-coredata://") { return value }
+        let matches = devices.filter { $0.name == value }
+        return matches.count == 1 ? matches[0].profileID : nil
+    }
+}
+
+func profile(for id: DeviceID, overrides: [String: String], in devices: [Device]) -> Device? {
+    if let chosen = overrides[id.key], let device = devices.first(where: { $0.profileID == chosen }) { return device }
     return devices.first { $0.id == id }
 }
+
+func settings(for id: DeviceID) -> Device? { profile(for: id, overrides: settingsOverrides, in: devices) }
 
 // The action's name, and the symbolic hotkey for it if uc-steer supports the action.
 func describe(_ action: [String: Any]) -> (name: String, hotKey: Int32?) {
@@ -245,8 +281,12 @@ func perform(_ action: [String: Any]) -> Bool {
 // Messages: UCS/version prefix, vendor/product (UInt16 big-endian), sender ID (UInt64 big-endian), CGEvent data.
 // CGEvent serialization drops field 87, so the sender ID must travel separately. Connection IDs scope sessions.
 let peers = Peers()
-var forwardingDestination = UserDefaults.standard.string(forKey: "forwardingDestination") {
-    didSet { UserDefaults.standard.set(forwardingDestination, forKey: "forwardingDestination") }
+// Stable authenticated peer identity. The old name-based "forwardingDestination" preference is dropped.
+var forwardingDestination: String? = {
+    UserDefaults.standard.removeObject(forKey: "forwardingDestination")
+    return UserDefaults.standard.string(forKey: "forwardingDestinationID")
+}() {
+    didSet { UserDefaults.standard.set(forwardingDestination, forKey: "forwardingDestinationID") }
 }
 // Explicit routing is a clean wire-format cutover: reject old peers' automatically broadcast events.
 let buttonMessagePrefix = Data([0x55, 0x43, 0x53, 0x01]) // UCS, version 1
@@ -302,27 +342,50 @@ func isSteerMouse(_ pid: Int64) -> Bool {
     return result
 }
 
+// Real effects of forwarding and replaying; checks substitute their own.
+struct ButtonEffects {
+    var post: (CGEvent) -> Void = { postReplayedButton($0) }
+    var act: ([String: Any]) -> Bool = { perform($0) }
+    var reload: () -> Void = { reloadSettingsIfChanged() }
+    var lookup: (DeviceID) -> Device? = { settings(for: $0) }
+    var destination: () -> String? = { forwardingDestination }
+    var connection: (String) -> UUID? = { peers.connection(to: $0) }
+    var send: (Data, Set<UUID>) -> Set<UUID> = { peers.send($0, to: $1) }
+    var pointerHere: () -> Bool = { pointerIsHere() }
+    var steerMouse: (Int64) -> Bool = { isSteerMouse($0) }
+    var device: (Int64) -> DeviceID? = { deviceID(sender: $0) }
+}
+
 // The press owns its route until release, even if the pointer moves or the connections disappear.
-func forward(_ type: CGEventType, _ event: CGEvent) -> Bool {
+func forward(_ type: CGEventType, _ event: CGEvent, _ fx: ButtonEffects = ButtonEffects()) -> Bool {
     guard type == .otherMouseDown || type == .otherMouseUp || type == .otherMouseDragged else { return false }
     let mouse = MouseButton(event)
     let pid = event.getIntegerValueField(.eventSourceUnixProcessID)
-    if let press = forwardedButtons[mouse], press.pid == pid {
-        if type == .otherMouseUp {
+    if let press = forwardedButtons[mouse] {
+        if type != .otherMouseDown {
+            if press.pid == pid {
+                if type == .otherMouseUp {
+                    forwardedButtons[mouse] = nil
+                    if !press.recipients.isEmpty, let message = buttonMessage(event, device: press.device) { _ = fx.send(message, press.recipients) }
+                }
+                return true
+            }
+        } else if supportedButton(mouse.button), pid > 0, fx.steerMouse(pid) {
+            // A valid new press means the old release was lost: release the old route first, even if the PID changed.
             forwardedButtons[mouse] = nil
-            if let message = buttonMessage(event, device: press.device) {
-                peers.send(message, to: press.recipients)
+            if let up = event.copy() {
+                up.type = .otherMouseUp
+                if !press.recipients.isEmpty, let message = buttonMessage(up, device: press.device) { _ = fx.send(message, press.recipients) }
             }
         }
-        return true
     }
     // Never forward an orphan release or a press which began on this Mac.
     guard type == .otherMouseDown, supportedButton(mouse.button), pid > 0,
-          let destination = forwardingDestination, let recipient = peers.connection(to: destination),
-          !pointerIsHere(), isSteerMouse(pid) else { return false }
-    let id = deviceID(sender: mouse.sender) ?? DeviceID(vendor: 0, product: 0)
+          let destination = fx.destination(), let recipient = fx.connection(destination),
+          !fx.pointerHere(), fx.steerMouse(pid) else { return false }
+    let id = fx.device(mouse.sender) ?? DeviceID(vendor: 0, product: 0)
     guard let message = buttonMessage(event, device: id) else { return false }
-    let recipients = peers.send(message, to: [recipient])
+    let recipients = fx.send(message, [recipient])
     guard !recipients.isEmpty else { return false }
     forwardedButtons[mouse] = ForwardedPress(pid: pid, device: id, recipients: recipients)
     log("sent button \(mouse.button + 1) of \(id.key) to the selected Mac: \(destination)")
@@ -352,7 +415,7 @@ func disconnectPeer(_ peer: UUID) {
 }
 
 // The sender explicitly selected this Mac. Its connection owns the press, independently of pointer movement.
-func replay(_ message: Data, from peer: UUID) {
+func replay(_ message: Data, from peer: UUID, _ fx: ButtonEffects = ButtonEffects()) {
     guard message.count > buttonMessageHeaderSize, message.starts(with: buttonMessagePrefix),
           let event = CGEvent(withDataAllocator: nil, data: Data(message.dropFirst(buttonMessageHeaderSize)) as CFData),
           event.type == .otherMouseDown || event.type == .otherMouseUp else { return }
@@ -365,20 +428,20 @@ func replay(_ message: Data, from peer: UUID) {
     if event.type == .otherMouseUp {
         if let release = takeReplayedRelease(button) {
             release.flags = event.flags
-            postReplayedButton(release)
+            fx.post(release)
         }
         return
     }
     guard replayedButtons[button] == nil else { return }
     let id = DeviceID(vendor: Int(message[b]) << 8 | Int(message[b + 1]),
                       product: Int(message[b + 2]) << 8 | Int(message[b + 3]))
-    reloadSettingsIfChanged()
-    if let action = settings(for: id)?.actions[1 << Int(mouse.button)], perform(action) {
+    fx.reload()
+    if let action = fx.lookup(id)?.actions[1 << Int(mouse.button)], fx.act(action) {
         replayedButtons[button] = .handled
     } else {
         logOnce("button \(mouse.button + 1) of \(id.key) from another Mac has no supported SteerMouse action here; passing it through")
         replayedButtons[button] = .posted(event)
-        postReplayedButton(event)
+        fx.post(event)
     }
 }
 
@@ -465,7 +528,7 @@ func check() {
     }
     print("Universal Control mice on this Mac now:")
     for mouse in remoteMice() {
-        let source = settings(for: mouse.id).map { "uses SteerMouse settings for \($0.name)" } ?? "no SteerMouse settings"
+        let source = settings(for: mouse.id).map { "uses SteerMouse settings for \($0.label)" } ?? "no SteerMouse settings"
         print("  \(mouse.name) (\(mouse.id.key)): \(source)")
     }
 }

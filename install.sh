@@ -7,9 +7,15 @@ app=/Applications/uc-steer.app
 # Signing every build with the same certificate keeps uc-steer's permissions across reinstalls (see README).
 identity="${CODESIGN_IDENTITY:-uc-steer dev}"
 
+# Only this user's processes; bounded wait (10s). Failure aborts, so cleanup rolls back.
 stop_app() {
-    pkill -x uc-steer || true
-    while pgrep -x uc-steer >/dev/null; do sleep 0.2; done
+    pkill -U "$(id -u)" -x uc-steer || true
+    ticks=50
+    while pgrep -U "$(id -u)" -x uc-steer >/dev/null; do
+        ticks=$((ticks - 1))
+        if [ "$ticks" -lt 0 ]; then echo "uc-steer did not quit in time." >&2; return 1; fi
+        sleep 0.2
+    done
 }
 
 if [ "${1:-}" = uninstall ]; then
@@ -40,6 +46,7 @@ activating=0
 committed=0
 cleanup() {
     rc=$?
+    trap '' INT TERM HUP # a repeated signal must not abort restoration
     trap - EXIT
     if [ "$committed" = 0 ]; then
         if [ -e "$old" ]; then
@@ -52,7 +59,9 @@ cleanup() {
         elif [ "$activating" = 1 ]; then
             rm -rf "$app" # fresh install: nothing to restore, drop the failed app
         fi
-        if [ "$rc" -ne 0 ] && [ "$stopped" = 1 ] && [ -e "$app" ]; then open "$app" || true; fi
+        if [ "$rc" -ne 0 ] && [ "$stopped" = 1 ] && [ -e "$app" ]; then
+            if open "$app"; then echo "Reopened the app." >&2; else echo "Could not reopen $app." >&2; fi
+        fi
     fi
     rm -rf "$stage"
     exit "$rc"

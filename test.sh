@@ -11,6 +11,8 @@ swiftc -swift-version 5 -parse-as-library Sources/PairingKey.swift Tests/Pairing
 # One file so `extension Peers` in the checks can reach Peers' private members.
 cat Sources/Peers.swift Tests/PeersChecks.swift > "$t/PeersChecks.swift"
 swiftc -swift-version 5 -parse-as-library Sources/Input.swift "$t/PeersChecks.swift" -o "$t/peers"
+# Whole production source set (incl. main.swift) with the installer's flags.
+swiftc -typecheck -swift-version 5 -target "$(uname -m)-apple-macos13.0" Sources/*.swift
 
 "$t/input"
 "$t/pairing"
